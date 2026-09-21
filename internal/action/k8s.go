@@ -1,6 +1,8 @@
 package action
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -107,6 +109,15 @@ func (K8sNormalizer) Normalize(args map[string]any, tgt Target) (*Action, error)
 	if manifest != nil {
 		raw, _ := json.Marshal(manifest)
 		out["manifest_bytes"] = len(raw)
+		// A digest over the *semantic* object, not over the bytes as received.
+		// Everything else lifted out of a manifest is a feature ("privileged",
+		// "host_path") or a size; without this, two manifests that differ only
+		// in a field policy does not read -- and happen to be the same length
+		// -- produce the same action hash, and one approval would cover both.
+		// json.Marshal sorts map keys, so reformatting and reordering do not
+		// move the digest while any change in content does.
+		sum := sha256.Sum256(raw)
+		out["manifest_digest"] = hex.EncodeToString(sum[:])
 		analyzeManifest(manifest, out)
 
 		// The argument name and the manifest name must agree. They are used in

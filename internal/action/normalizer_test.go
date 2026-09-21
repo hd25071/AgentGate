@@ -1,6 +1,8 @@
 package action
 
 import (
+	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -113,6 +115,141 @@ func TestRedisDisguisesAreFoldedAndFlagged(t *testing.T) {
 			t.Errorf("%q: no obfuscation notes recorded for the audit trail", cmd)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Case sensitivity of the data parameters
+//
+// Normalization folds the *command name*: "flushall", "FlUsHaLL" and
+// "%46LUSHALL" are one command, and policy reads command_upper. Redis keys and
+// values are a different matter -- they are byte strings, and "orders:1001" is
+// not "ORDERS:1001". Folding them together would collapse two distinct actions
+// onto one hash, and an approval given for one key would authorize the other.
+// That is the "approve this, execute that" gap the hash exists to close, so the
+// property gets its own test rather than riding along with the disguise test.
+// ---------------------------------------------------------------------------
+
+func TestRedisDataParametersKeepTheirCase(t *testing.T) {
+	lower := mustNormalizeRedis(t, "DEL orders:1001")
+	upper := mustNormalizeRedis(t, "DEL ORDERS:1001")
+
+	// The command name is the same command in both spellings.
+	if lower.ArgString("command_upper") != "DEL" || upper.ArgString("command_upper") != "DEL" {
+		t.Fatalf("command_upper = %q / %q, want DEL in both",
+			lower.ArgString("command_upper"), upper.ArgString("command_upper"))
+	}
+	// The key is not.
+	if got := lower.ArgStrings("keys"); len(got) != 1 || got[0] != "orders:1001" {
+		t.Errorf("DEL orders:1001 normalized its key to %q", got)
+	}
+	if got := upper.ArgStrings("keys"); len(got) != 1 || got[0] != "ORDERS:1001" {
+		t.Errorf("DEL ORDERS:1001 normalized its key to %q", got)
+	}
+	if lower.Hash == upper.Hash {
+		t.Fatal("DEL orders:1001 and DEL ORDERS:1001 hash the same: " +
+			"an approval for one key would authorize the other")
+	}
+
+	// Values matter the same way as keys.
+	for _, tc := range []struct{ a, b string }{
+		{"SET backdoor 1", "SET BACKDOOR 1"},
+		{"SET flag OFF", "SET flag off"},
+		{"HSET user:1 role Admin", "HSET user:1 role admin"},
+	} {
+		if mustNormalizeRedis(t, tc.a).Hash == mustNormalizeRedis(t, tc.b).Hash {
+			t.Errorf("%q and %q hash the same: a data value was case-folded", tc.a, tc.b)
+		}
+	}
+
+	// Policy still sees one command in both spellings.
+	if got := mustNormalizeRedis(t, "del orders:1001").ArgString("command_upper"); got != "DEL" {
+		t.Errorf("command_upper = %q for a lowercase spelling, want DEL", got)
+	}
+
+	// The hash, by contrast, is allowed to keep the original spelling -- see
+	// the comment on hashable. Over-sensitivity costs the approver a second
+	// prompt; under-sensitivity is the hole. This assertion pins the direction
+	// so that a later "cleanup" folding argv into the canonical form cannot
+	// quietly make the hash blunter than the policy that reads it.
+	if mustNormalizeRedis(t, "del orders:1001").Hash == lower.Hash {
+		t.Error("the hash no longer distinguishes spellings of the command name: " +
+			"the fold has leaked into the hash, which must stay at least as sensitive as policy")
+	}
+}
+
+// The same rule for the other normalizers: a resource name is data, and so is
+// everything inside a manifest.
+func TestNonRedisDataParametersKeepTheirCase(t *testing.T) {
+	cases := []struct {
+		tool string
+		a, b map[string]any
+	}{
+		{
+			tool: "k8s_delete",
+			a:    map[string]any{"kind": "Deployment", "name": "web", "namespace": "payments"},
+			b:    map[string]any{"kind": "Deployment", "name": "WEB", "namespace": "payments"},
+		},
+		{
+			tool: "k8s_apply",
+			a: map[string]any{"namespace": "default", "manifest": map[string]any{
+				"kind": "ConfigMap", "metadata": map[string]any{"name": "app-config"},
+				"data": map[string]any{"log_level": "debug"}}},
+			b: map[string]any{"namespace": "default", "manifest": map[string]any{
+				"kind": "ConfigMap", "metadata": map[string]any{"name": "app-config"},
+				"data": map[string]any{"log_level": "DEBUG"}}},
+		},
+	}
+	for _, tc := range cases {
+		first := mustNormalizeK8s(t, tc.tool, tc.a)
+		second := mustNormalizeK8s(t, tc.tool, tc.b)
+		if first.Hash == second.Hash {
+			t.Errorf("%s: %v and %v hash the same: a data parameter was case-folded", tc.tool, tc.a, tc.b)
+		}
+	}
+}
+
+// The manifest fix above must not be paid for with formatting sensitivity.
+// Re-serialising the same manifest -- different key order, different
+// indentation -- is the same object, and the hash is over semantics.
+func TestManifestReformattingDoesNotMoveTheHash(t *testing.T) {
+	same := map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata":   map[string]any{"name": "web", "namespace": "payments"},
+		"spec":       map[string]any{"replicas": 3},
+	}
+	reordered := map[string]any{
+		"spec":       map[string]any{"replicas": 3},
+		"metadata":   map[string]any{"namespace": "payments", "name": "web"},
+		"kind":       "Deployment",
+		"apiVersion": "apps/v1",
+	}
+	// The same object arriving as a JSON string rather than a parsed map.
+	asString, err := json.Marshal(same)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base := mustNormalizeK8s(t, "k8s_apply", map[string]any{"namespace": "payments", "manifest": same})
+	for name, variant := range map[string]any{
+		"reordered keys":  reordered,
+		"json string":     string(asString),
+		"indented string": reindent(t, asString),
+	} {
+		got := mustNormalizeK8s(t, "k8s_apply", map[string]any{"namespace": "payments", "manifest": variant})
+		if got.Hash != base.Hash {
+			t.Errorf("%s moved the hash: the manifest digest is over bytes, not semantics", name)
+		}
+	}
+}
+
+func reindent(t *testing.T, in []byte) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, in, "  ", "\t"); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String()
 }
 
 func TestRedisFragmentsAreCounted(t *testing.T) {
