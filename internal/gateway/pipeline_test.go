@@ -266,12 +266,12 @@ func waitForApproval(t *testing.T, h *harness, id string) *store.Approval {
 		if err != nil {
 			t.Fatalf("get approval: %v", err)
 		}
-		if ap.Status != store.StatusPending && ap.Status != store.StatusApproved {
+		if h.gw.Approvals().Settled(ap.Status) {
 			return ap
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatalf("approval %s never left the pending state", id)
+	t.Fatalf("approval %s never settled", id)
 	return nil
 }
 

@@ -190,8 +190,11 @@ func (g *Gateway) registerTools() {
 	})
 
 	g.mcp.Add(mcp.Tool{
-		Name:        "agentgate_approval_wait",
-		Description: "Wait for a pending approval to be decided, then report the outcome. Returns as soon as the approval leaves the pending state or the timeout expires.",
+		Name: "agentgate_approval_wait",
+		Description: "Wait for a pending approval to settle, then report the outcome. Returns once the " +
+			"approval has been rejected, has expired, or -- when it was approved -- the action it covers " +
+			"has finished executing, so the status is one of rejected / expired / executed / failed. A " +
+			"timeout returns the last state observed, which may still be pending or approved.",
 		InputSchema: obj(map[string]any{
 			"approval_id":     strProp("The approval id."),
 			"timeout_seconds": intProp("How long to wait, at most 300 seconds."),
@@ -225,8 +228,13 @@ func (g *Gateway) approvalResult(ap *store.Approval) mcp.CallToolResult {
 		structured["result"] = rawJSON(ap.ResultJSON)
 	}
 	text := fmt.Sprintf("approval %s is %s\n%s\naction_hash=%s", ap.ID, ap.Status, ap.Summary, ap.ActionHash)
-	if ap.Status == store.StatusPending {
+	switch ap.Status {
+	case store.StatusPending:
 		text += fmt.Sprintf("\n%d of %d required approvals collected", countVotes(ap), ap.Required)
+	case store.StatusApproved:
+		// The vote is recorded and the executor has not written the outcome
+		// back yet. Saying so is the difference between "approved" and "done".
+		text += "\napproved; execution is in progress and its outcome is not recorded yet"
 	}
 	if ap.RollbackHint() != "" {
 		text += "\nrollback: " + ap.RollbackHint()

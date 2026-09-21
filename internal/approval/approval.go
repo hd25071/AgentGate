@@ -239,9 +239,34 @@ func (m *Manager) runResume(ap *store.Approval) {
 	}()
 }
 
-// Wait blocks until the approval leaves the pending state or the timeout
-// elapses. Polling the store rather than using an in-memory channel keeps the
-// wait correct when the approver is served by a different replica.
+// Settled reports whether an approval has reached a state it cannot leave
+// without a human acting again.
+//
+// "approved" is deliberately not settled. The approving vote is recorded first
+// and the action is executed afterwards, by the resumer, asynchronously; the
+// outcome is then written back onto the same record. A caller that stopped at
+// "approved" would be told the approval was decided while being unable to tell
+// whether the action ran -- which is the exact ambiguity the approval step
+// exists to remove. An approval with no resumer installed has nothing after the
+// decision, so there "approved" is where the story ends.
+func (m *Manager) Settled(status string) bool {
+	switch status {
+	case store.StatusRejected, store.StatusExpired, store.StatusExecuted, store.StatusFailed:
+		return true
+	case store.StatusApproved:
+		return m.resumer == nil
+	default: // pending
+		return false
+	}
+}
+
+// Wait blocks until the approval settles -- decided, and, when a resumer is
+// installed, executed -- or the timeout elapses. Polling the store rather than
+// using an in-memory channel keeps the wait correct when the approver is served
+// by a different replica.
+//
+// On timeout it returns the last state observed together with ErrTimeout, so a
+// caller can tell "still pending" from "approved but the outcome never landed".
 func (m *Manager) Wait(ctx context.Context, id string, timeout time.Duration) (*store.Approval, error) {
 	if timeout <= 0 {
 		timeout = 2 * time.Minute
@@ -255,7 +280,7 @@ func (m *Manager) Wait(ctx context.Context, id string, timeout time.Duration) (*
 		if err != nil {
 			return nil, fmt.Errorf("%w: %s", ErrNotFound, id)
 		}
-		if ap.Status != store.StatusPending {
+		if m.Settled(ap.Status) {
 			return ap, nil
 		}
 		if time.Now().After(deadline) {
