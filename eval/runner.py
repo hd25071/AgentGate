@@ -322,7 +322,9 @@ class Runner:
             "leaks_with_rubber_stamp_approver": rubber_leaks,
         }
 
-    def write_markdown(self, summary: dict, results: list[PayloadResult], meta: dict) -> str:
+    def write_markdown(
+        self, summary: dict, results: list[PayloadResult], meta: dict, chain: dict | None = None
+    ) -> str:
         o = summary["overall"]
         b = summary["benign"]
         lines = []
@@ -346,7 +348,25 @@ class Runner:
         lines.append(f"| guarded execution rate (rubber-stamp approver) | **{o['rubber_stamp_rate']}%** |")
         lines.append(f"| benign hard false-positive rate | **{b['hard_false_positive_rate']}%** |")
         lines.append(f"| benign friction rate (needs approval) | {b['friction_rate']}% |")
+        if chain is not None:
+            lines.append(f"| audit chain | `valid={chain.get('valid')}` |")
         lines.append("")
+        if chain is not None:
+            lines.append("## Audit chain")
+            lines.append("")
+            length = chain.get("length")
+            if chain.get("valid"):
+                lines.append(
+                    f"`VerifyChain` over the whole run: **valid**, {length} records, "
+                    "each hash covering its predecessor."
+                )
+            else:
+                lines.append(
+                    f"`VerifyChain` over the whole run: **broken**, {length} records read, "
+                    f"first failure at seq `{chain.get('broken_at')}`. "
+                    f"Reason: {chain.get('reason') or 'not reported'}."
+                )
+            lines.append("")
         lines.append("## By carrier")
         lines.append("")
         lines.append("| carrier | payloads | injection % | guarded exec % | rubber-stamp % |")
@@ -526,6 +546,12 @@ def main() -> int:
         print(f"  ran {len(benign_results)} benign tasks")
 
     summary = runner.summarise(results, benign_results)
+
+    # Checked once the run is over and before the report is written: if any of the
+    # above wrote to a target system, the record of it is in the chain, and the
+    # report has to carry the verdict rather than leaving it on stdout.
+    chain = runner.scoped.verify_chain()
+
     meta = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "gateway_url": runner.base,
@@ -546,6 +572,7 @@ def main() -> int:
 
     payload = {
         "meta": meta,
+        "audit_chain": chain,
         "summary": summary,
         "results": [r.to_dict() for r in results],
         "samples": {r.id: r.samples for r in results},
@@ -555,12 +582,9 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    md = runner.write_markdown(summary, results, meta)
+    md = runner.write_markdown(summary, results, meta, chain)
     out.with_suffix(".md").write_text(md, encoding="utf-8")
 
-    # The chain is the last thing checked: if any of the above wrote to a target
-    # system, the record of it is here.
-    chain = runner.scoped.verify_chain()
     print(f"\naudit chain: valid={chain.get('valid')} records={chain.get('length')}")
 
     o = summary["overall"]

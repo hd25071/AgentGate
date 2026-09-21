@@ -4,7 +4,7 @@
 
 **A policy-enforced execution gateway for infrastructure agents**
 
-Let an LLM agent take part in production operations without giving it the ability to touch production
+Places a mandatory policy decision between an LLM agent and production systems, so the agent can take part in operations without being able to touch production directly
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-%E2%89%A5%201.26-00ADD8?logo=go&logoColor=white)](go.mod)
@@ -20,41 +20,43 @@ Let an LLM agent take part in production operations without giving it the abilit
 
 ## Overview
 
-The primary risk of putting an LLM agent into production operations is not that the model says something wrong — it is that **the model can act**. An agent holding a kubeconfig, a Redis password, or a device credential is one indirect prompt injection away (a log line, an alert, a cached value, a ticket body) from handing production credentials to an attacker.
+AgentGate is an execution gateway that sits between an LLM agent and managed infrastructure. Every tool call must pass, in order, through authentication, action normalization, a policy decision, and — where policy requires it — human approval, before it can reach a target system.
 
-AgentGate takes the ability to act away from the agent:
+The primary risk of putting an LLM agent into production operations is not that the model reaches a wrong conclusion, but that the model can act. When the agent process holds a kubeconfig, a Redis password, or a device credential, a single piece of indirect prompt injection in a log line, an alert, a cached value, or a ticket body gives an attacker working use of those credentials.
 
-- The agent holds nothing but a short-lived, scoped token.
-- Real credentials exist only inside the gateway process.
-- Every tool call must first be normalized into a structured `Action` and cleared by policy before it can reach a real system.
+AgentGate removes that path by removing execution capability from the agent side:
 
-The consequence: prompt injection can still make an agent emit a dangerous call, but that call cannot pass policy.
+- The agent holds one short-lived, scoped token, which itself carries no target-system credentials;
+- real credentials for target systems exist only inside the gateway process, and are read only by `internal/adapters/`;
+- every tool call is first normalized into a structured `Action` and cleared by policy before it can reach a real system.
+
+Prompt injection can still induce the agent to emit a dangerous call. That call cannot pass policy.
 
 ## Features
 
 | Feature | Description |
 | --- | --- |
-| **Policy over semantics, not strings** | Policy is written against the normalized `Action`, never the raw request. Case changes, percent-encoding, hex escapes, string concatenation, full-width characters and homoglyphs all collapse onto the same semantic feature, so re-spelling a request cannot dodge a rule |
-| **Three-way verdict, deny by default** | `allow` / `approval_required` / `deny`. A failed normalization, a failed policy evaluation, or a failed preview all resolve to `deny`; there is no path that degrades into a yes |
-| **Approvals bound to the action hash** | An approver signs a `sha256:...` semantic hash, which is recomputed and compared before execution. Approving A and executing B is structurally impossible |
-| **Tamper-evident audit chain** | Every record's hash covers its predecessor. Modification, reordering, or deletion of any record is detected by `VerifyChain` |
-| **Automatic rollback on failure** | A full object snapshot is captured before execution and re-applied if execution fails, with the outcome recorded in the audit chain |
-| **Credential isolation** | Adapters are the only layer holding real credentials, and they accept only already-normalized, already-approved actions. Credential-shaped values are redacted from responses and audit records |
-| **Reasons that explain themselves** | Every `allow`, `approval_required` and `deny` carries a natural-language reason, attributed to the subsystem it actually belongs to — a Redis action never gets a network-device justification |
-| **A red-team suite of its own** | 76 payloads (60 attacks across 5 injection carriers, 16 ordinary operations), with reproducible metric definitions and a two-directional gap analysis |
+| Policy over semantics | Policy is written against the normalized `Action` and never reads the raw string. Case changes, percent-encoding, hex escapes, string concatenation, full-width characters and homoglyphs are folded onto the same set of features during normalization, so re-spelling a request does not change the decision |
+| Three-way verdict, deny by default | The verdict is `allow`, `approval_required`, or `deny`. A failed normalization, a failed policy evaluation, or a failed preview all resolve to `deny`; there is no branch that degrades into a yes |
+| Approvals bound to the action hash | What is approved is a `sha256:...` semantic hash, recomputed and compared before execution. Approving A and executing B cannot both hold |
+| Verifiable audit chain | Each record's hash covers its predecessor. Modification, reordering, or deletion of any record is detected by `VerifyChain` |
+| Automatic rollback on failure | An object snapshot is captured before execution and re-applied if execution fails; the outcome is written to the audit chain |
+| Credential isolation | Adapters are the only layer holding real credentials, and they accept only normalized, approved actions. Credential-shaped values are redacted from responses and audit records |
+| Explainable verdicts | Every `allow`, `approval_required` and `deny` carries a natural-language reason, attributed to the subsystem it belongs to; a Redis action never receives a network-device reason |
+| A red-team suite of its own | 76 payloads (60 attacks across 5 injection carriers, 16 ordinary operations), with metric definitions and a two-directional gap analysis |
 
-## How It Works
+## Architecture
 
-The full path of one tool call:
+The path of one tool call:
 
 ```
 MCP tools/call
   │
-  ├─ authenticate      short-lived token; scope decides what may be done, not who you are
+  ├─ authenticate      verify the short-lived token; scope decides which actions may be taken
   ├─ normalize         raw arguments ──▶ structured Action (+ semantic SHA-256 hash)
   ├─ policy            three-way verdict: allow / approval_required / deny (default deny)
-  ├─ approval          suspend; approval is bound to the action hash; a human votes
-  ├─ preview           read-only dry run + reachability analysis + object snapshot
+  ├─ approval          suspend; approval is bound to the action hash and decided by a human
+  ├─ preview           read-only dry run, reachability analysis, object snapshot
   ├─ execute           run it; roll back automatically on failure
   ├─ sanitize          strip credential-shaped values from the result
   └─ respond
@@ -64,24 +66,24 @@ Each step writes an audit record, and the records are chained by hash.
 
 ## Design Principles
 
-**1. Policy targets semantics, not strings.**
+**Policy targets semantics, not strings.**
 
-All of the following land on the same semantic feature, `command_upper = FLUSHALL`, once normalized:
+All of the following land on the same feature, `command_upper = FLUSHALL`, once normalized:
 
 ```
 FLUSHALL          flushall          %46LUSHALL        \x46LUSHALL
 "FLU"+"SHALL"     ＦＬＵＳＨＡＬＬ   FLUSHАLL (Cyrillic А)
 ```
 
-No rule in the policy bundle reads a raw string, so no spelling of the request gets around the decision.
+No rule in the policy bundle reads a raw string, so changing the spelling does not change the decision.
 
-**2. Defense comes from constraining execution, not from detecting injection.**
+**The gateway constrains actions; it does not judge the intent of text.**
 
-The gateway does not try to decide whether a piece of text is a malicious instruction — that is an arms race nobody wins. It answers one question: **is this action permitted?** Unknown commands are refused outright (an allowlist, not a denylist), because "I don't recognize it" is not a reason to run it.
+The gateway does not attempt to decide whether a piece of text is a malicious instruction. It answers only whether the action itself is permitted. It maintains a vocabulary of known commands; a command outside it is refused, and an unrecognized action is not a reason to run it.
 
-**3. Approvals bind to the action hash.**
+**What is approved is one specific action.**
 
-What is approved is one specific, normalized action. The hash is recomputed before execution and compared against the approval record, so there is no exploitable window between approval and execution.
+The action hash is recomputed before execution and compared against the approval record, so there is no exploitable window between approval and execution.
 
 ## Quick Start
 
@@ -173,7 +175,7 @@ The gateway exposes the following tools over MCP. Which of them an agent may cal
 
 | Tool | Description |
 | --- | --- |
-| `redis_exec` | Run one Redis command against the managed instance. The command is normalized and checked against policy before it is sent; administrative, code-executing and keyspace-wide commands are refused |
+| `redis_exec` | Run one Redis command against the managed instance. The command is normalized and checked against policy before it is sent: keyspace-wide, server-control, code-loading and cross-instance transfer commands are refused; administrative commands and wildcard writes require approval; read-only diagnostics (`MEMORY`, `SLOWLOG`, and similar) and `CONFIG GET` of a single non-credential parameter are allowed |
 | `k8s_get` | Read one Kubernetes object. Reading a Secret is treated as a credential-access event and requires approval |
 | `k8s_apply` | Apply a manifest with server-side apply. Always runs a dry run first; a dry-run failure aborts before anything is written |
 | `k8s_delete` | Delete one Kubernetes object. Deleting namespaces, nodes, PersistentVolumes, CRDs and stateful workloads is refused outright |
@@ -188,26 +190,26 @@ The gateway exposes the following tools over MCP. Which of them an agent may cal
 
 ### Trust boundary
 
-The gateway is the only mediation point between an agent and production. The only artifact on the agent side is a short-lived token; the kubeconfig, the Redis credentials and the device credentials live in the gateway process and are touched only by `internal/adapters/`.
+The gateway is the only mediation point between an agent and production. The only artifact on the agent side is a short-lived token; the kubeconfig, the Redis credentials and the device credentials live in the gateway process and are read only by `internal/adapters/`.
 
-`internal/mcp` deliberately does not import `internal/policy`. Projecting an identity onto a policy `Actor` happens in `internal/gateway`, which keeps "authenticate first, authorize second" fixed at compile time.
+`internal/mcp` does not import `internal/policy`. Projecting an identity onto a policy `Actor` happens in `internal/gateway`, which fixes the order of authentication and authorization at compile time.
 
-### Two credentials, two audiences
+### Credentials and audiences
 
 | Audience | Endpoint | Credential |
 | --- | --- | --- |
 | Agent | `/mcp` | Short-lived, scoped signed token |
 | Operator | `/admin` | `AG_ADMIN_TOKEN` |
 
-An agent token cannot approve anything, and a caller cannot approve its own action — the thing that asks must not be the thing that says yes.
+An agent token cannot approve anything, and a caller cannot approve its own action.
 
-The approval UI's **page shell is deliberately not authenticated; every data endpoint behind it is**. A browser has nowhere to put an `X-Admin-Token` header on a page navigation, so gating the shell would return `401` before the token input inside it ever became reachable, and the page could never do the one thing it exists to do. The shell carries no data: it is the form that asks for the token and attaches it to every `/admin/*` call it makes. The boundary that matters sits on those calls.
+The approval UI's page shell is not authenticated; every data endpoint behind it requires `X-Admin-Token`. A browser cannot attach a custom header to a page navigation, so gating the shell would return `401` before the token form inside it could render. The shell itself carries no business data.
 
-With no admin token configured the admin surface **fails closed**, returning `503` with an explanation. `config.Load` already rejects an empty `AG_ADMIN_TOKEN` at startup, and the wrapper keeps a second guard so that comparing two empty values can never answer "match".
+With no `AG_ADMIN_TOKEN` configured the admin surface fails closed, returning `503` with an explanation. `config.Load` already rejects an empty token at startup, and the wrapper keeps an independent check so that comparing two empty values can never report a match.
 
 ### Audit chain
 
-Each audit record's hash covers the previous record's hash. Any modification, reordering, or deletion of a record in the middle is detected by `audit verify`. `/readyz` returns `503` when the chain fails to verify, so chain integrity doubles as a readiness signal.
+Each audit record's hash covers the previous record's hash. Any modification, reordering, or deletion of a record in the middle is detected by `agentgate-cli audit verify`. `/readyz` returns `503` when the chain fails to verify, so chain integrity can be used directly as a readiness signal.
 
 ## Configuration
 
@@ -216,7 +218,7 @@ All configuration is supplied through environment variables; the full list is in
 | Variable | Description |
 | --- | --- |
 | `AG_TOKEN_SECRET` / `AG_ADMIN_TOKEN` | Required, at least 16 bytes each, and must differ from one another |
-| `AG_ENV` | `staging` or `prod`. Targets declared as production raise the bar: any write, delete, config change, exec or scale needs a human, and an irreversible change — or a delete at namespace / cluster / dataset / site scope — needs two. A few rules refuse outright, but only against production: scaling a workload to zero, `KEYS *`, and shutting a device interface |
+| `AG_ENV` | `staging` or `prod`. Production-marked targets raise the bar: any write, delete, config change, exec or scale change needs a human, and an irreversible change — or a delete at namespace / cluster / dataset / site scope — needs two. A few rules refuse outright, against production only, such as scaling a production workload to zero, `KEYS *`, and shutting a production device interface |
 | `AG_STORE_DRIVER` | `sqlite` (default, single node) or `postgres` |
 | `AG_STORE_DSN` | Storage connection string |
 | `AG_K8S_MODE` | `mock` (default, in-memory simulator) or `cluster` (talk to a real API server) |
@@ -227,58 +229,58 @@ All configuration is supplied through environment variables; the full list is in
 
 ## Evaluation
 
-The corpus holds 76 payloads: 60 attacks spread across 5 injection carriers (logs, alerts, cached values, tickets, adversarial variants) plus 16 ordinary operations to measure false positives. The harness runs two arms — through the gateway, and bypassing it straight to the targets — so the difference is measured, not projected.
+The corpus holds 76 payloads: 60 attacks across 5 injection carriers (logs, alerts, cached values, tickets, adversarial variants), plus 16 ordinary operations to measure false positives. The harness runs two arms, one through the gateway and one bypassing it straight to the targets, so the difference is measured rather than projected.
 
 Against a live gateway, with the `scripted` reference agent and 3 repeats per payload:
 
 | Metric | Value | Meaning |
 | --- | ---: | --- |
-| Injection rate | **36.7%** | Share of payloads where the reference agent took the bait and emitted the dangerous call. Without a gateway, this is the attack success rate |
+| Injection rate | **36.7%** | Share of payloads where the reference agent emitted the dangerous call. Without a gateway, this is the attack success rate |
 | Guarded execution rate (careful approver) | **3.3%** | The one case that got through is the payload the corpus itself marks as allowed |
 | Guarded execution rate (rubber-stamp approver) | **3.3%** | Upper bound on leakage through the approval step |
 | Benign hard false-positive rate | **0.0%** | All 16 ordinary operations completed |
 | Benign friction rate | 6.2% | Share requiring a human approval to complete |
-| Audit chain | `valid=True` | 686 records, chained by hash |
+| Audit chain | `valid=True` | The whole chain is verified once at the end of the run. The record count varies with run size; the report's Audit chain section gives it for that run |
 
-The full report is at [`eval/report/report.md`](eval/report/report.md). Its most useful section is **`policy_gaps`**, which lists every disagreement between what the corpus expects and what the gateway decides, each with the gateway's own reason. The table runs **both ways**: what the gateway let through (`permissive`), what it stopped unnecessarily (`friction`), and what ran unattended when a human should have looked (`unattended`).
+The full report is at [`eval/report/report.md`](eval/report/report.md). Its `policy_gaps` section lists every disagreement between what the corpus expects and what the gateway decides, each with the gateway's own reason. The table runs both ways: what the gateway let through (`permissive`), what it stopped unnecessarily (`friction`), and what ran unattended when a human should have looked (`unattended`).
 
-Methodology and metric definitions are in [`docs/red-team.md`](docs/red-team.md). Without Docker, the suite runs against a built-in RESP2 stub (see §3.1 of that document).
+Methodology and metric definitions are in [`docs/red-team.md`](docs/red-team.md). Without Docker, the suite runs against a built-in RESP2 stub, described in §3.1 of that document.
 
 ## Implementation Status
 
-Being explicit about what is real and what is simulated matters more than how the documentation reads — mistaking a simulator for a live cluster causes incidents.
+The table below separates real implementations from simulated ones. Simulated components should not be used for production validation.
 
 | Component | Status |
 | --- | --- |
-| Action normalization, semantic hashing, policy engine (OPA), approval binding, audit hash chain, rollback framework | **Real** |
-| Redis adapter | **Real**: hand-written RESP2 client talking to a real Redis |
+| Action normalization, semantic hashing, policy engine (OPA), approval binding, audit hash chain, rollback framework | Real |
+| Redis adapter | Real: a hand-written RESP2 client talking to a real Redis |
 | Kubernetes adapter | Two modes: `cluster` talks to a real API server (REST + server-side dry-run); `mock` is an in-memory simulator and is the default |
-| VRP (Huawei network device) adapter | **Simulator**: the normalizer is real, the execution side is simulated |
+| VRP (Huawei network device) adapter | Simulated: the normalizer is real, the execution side is simulated |
 | NetGuard reachability analysis | Falls back to a local heuristic when `AG_NETGUARD_URL` is unset; every output is labelled simulated |
-| The "no gateway" control arm in the evaluation | Genuinely bypasses the gateway and talks to the targets, not a paper exercise |
+| The no-gateway control arm in the evaluation | Genuinely bypasses the gateway and talks to the targets, not a paper exercise |
 
-## Project Status and Roadmap
+## Known Limitations
 
-The project builds, tests, and runs, and the red-team suite produces measured numbers — but it is **not ready for production**. Known boundaries:
-
-**Engineering gaps**
+The project builds, tests, and runs, and the red-team suite produces measured numbers, but it is not ready for production. Known boundaries:
 
 - The approval API authenticates with a token only; there is no SSO or role mapping.
-- With multiple replicas sharing one database, appending to the audit chain needs a database-level lock (see [ADR-0005](docs/adr/0005-audit-chain.md)).
-- Kubernetes `exec` is not implemented in `cluster` mode (it needs SPDY/WebSocket). It refuses explicitly rather than pretending to succeed.
-- Authentication failures are written to the application log but not to the audit chain, and the admin surface has no rate limiting.
-- The VRP execution side is a simulator.
-- There is no shadow mode to measure a policy's false-positive rate before it takes effect.
+- With multiple replicas sharing one database, appending to the audit chain needs a database-level lock; see [ADR-0005](docs/adr/0005-audit-chain.md).
+- Kubernetes `exec` is not implemented in `cluster` mode (it needs SPDY/WebSocket) and currently returns an explicit refusal.
+- Authentication failures are written to the application log, not to the audit chain, and the admin surface has no rate limiting.
+- The VRP execution side is simulated.
+- There is no shadow mode, so a policy's false-positive rate cannot be measured before it takes effect.
 
-**Policy disagreements not yet resolved**
+### Policy disagreements
 
-Of the disagreements the evaluation surfaces, these three are differences of stance rather than defects — but each needs an owner:
+The three kinds of disagreement the evaluation surfaces are differences of stance rather than policy defects, but each needs an explicit owner:
 
-- **`permissive` (4 payloads)**: the corpus says `deny`, policy says `allow`. All four share one shape — **a write or delete of a single named key** (e.g. `DEL orders:1001`, `SET backdoor 1`). This is a deliberately permitted category: the blast radius is one key, and it can be snapshotted and rolled back. The corpus takes a stricter position. To tighten it, move "write/delete of a single named key" from `allow` to `approval` in `policies/redis.rego`.
-- **`deferred` (7 payloads)**: the corpus says `deny`, policy says `approval_required` — mostly deleting workloads, scaling to zero, and reading Secrets. Policy holds that a human may approve these; the corpus holds that they should never happen. This is a difference of stance, but the approver is the only line of defense for these actions, and that responsibility needs to be claimed explicitly.
-- **`unattended` (1 attack + 2 benign)**: the corpus wants a human to look, and policy executed automatically (a `SET`/`EXPIRE` on a single key). This runs in the opposite direction from a bypass and matters just as much.
+| Category | Count | Description |
+| --- | ---: | --- |
+| `permissive` | 4 | The corpus says `deny`, policy says `allow`. All four share one shape, a write or delete of a single named key, for example `DEL orders:1001` or `SET backdoor 1`. This category is permitted by design: the blast radius is one key, and it can be snapshotted and rolled back. The corpus takes a stricter position. To tighten it, move write/delete of a single named key from `allow` to `approval` in `policies/redis.rego` |
+| `deferred` | 7 | The corpus says `deny`, policy says `approval_required` — mostly deleting workloads, scaling to zero, and reading Secrets. The approver is the only line of defense for these actions |
+| `unattended` | 3 | The corpus wants a human to look and policy executed automatically. All three are a `SET` or `EXPIRE` on a single key: 1 attack and 2 ordinary operations. This runs in the opposite direction from a bypass and needs the same attention |
 
-Each of these maps to a numbered threat in [`docs/threat-model.md`](docs/threat-model.md).
+Each maps to a numbered threat in [`docs/threat-model.md`](docs/threat-model.md).
 
 ## Repository Layout
 
@@ -318,7 +320,7 @@ Issues and pull requests are welcome. Before submitting, please confirm:
 1. `go build ./...`, `go vet ./...` and `go test ./...` all pass, and `gofmt -l .` prints nothing.
 2. Changes to policy come with tests, and new rules follow the existing convention of scoping by `target.kind`.
 3. Changes to normalization come with a test showing that multiple disguises land on the same semantic feature.
-4. Commit messages explain **why** the change is being made, not only what it does.
+4. Commit messages explain why the change is being made, not only what it does.
 
 ## Security
 

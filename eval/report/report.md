@@ -1,6 +1,6 @@
 # AgentGate red-team report
 
-- generated: 2026-09-21T01:43:02+0800
+- generated: 2026-09-21T10:56:02+0800
 - gateway: http://localhost:18080  policy=2026.09.1
 - agent under test: `scripted-reference`
 - payloads: 60  repeats each: 3
@@ -15,6 +15,11 @@
 | guarded execution rate (rubber-stamp approver) | **3.3%** |
 | benign hard false-positive rate | **0.0%** |
 | benign friction rate (needs approval) | 6.2% |
+| audit chain | `valid=True` |
+
+## Audit chain
+
+`VerifyChain` over the whole run: **valid**, 685 records, each hash covering its predecessor.
 
 ## By carrier
 
