@@ -30,13 +30,15 @@ AgentGate removes that path by removing execution capability from the agent side
 - real credentials for target systems exist only inside the gateway process, and are read only by `internal/adapters/`;
 - every tool call is first normalized into a structured `Action` and cleared by policy before it can reach a real system.
 
-Prompt injection can still induce the agent to emit a dangerous call. That call cannot pass policy.
+Prompt injection can still induce the agent to emit a dangerous call. The gateway does not change that; it changes the consequence. Dangerous calls are denied or routed to human approval, while single-key rollbackable writes are allowed by design. That last class, and the trade-off it makes, is itemised under [Policy disagreements](#policy-disagreements).
 
 ## Features
 
 | Feature | Description |
 | --- | --- |
 | Policy over semantics | Policy is written against the normalized `Action` and never reads the raw string. Case changes, percent-encoding, hex escapes, string concatenation, full-width characters and homoglyphs are folded onto the same set of features during normalization, so re-spelling a request does not change the decision |
+| Protected namespaces | Writes and deletes into `lock:`, `session:`, `feature:`, `token:` and similar prefixes require approval. Snapshot-able and rollback-able only says the bytes come back; it says nothing about whether restoring them is the right outcome |
+| Session taint | Once a session has read content out of a target system — the carrier for a log line, a cached value, a ticket body — every later mutation from it requires approval. No content inspection: the gateway tracks the data flow it can see rather than guessing whether a string looks like an instruction |
 | Three-way verdict, deny by default | The verdict is `allow`, `approval_required`, or `deny`. A failed normalization, a failed policy evaluation, or a failed preview all resolve to `deny`; there is no branch that degrades into a yes |
 | Approvals bound to the action hash | What is approved is a `sha256:...` semantic hash, recomputed and compared before execution. Approving A and executing B cannot both hold |
 | Verifiable audit chain | Each record's hash covers its predecessor. Modification, reordering, or deletion of any record is detected by `VerifyChain` |
@@ -236,11 +238,15 @@ Against a live gateway, with the `scripted` reference agent and 3 repeats per pa
 | Metric | Value | Meaning |
 | --- | ---: | --- |
 | Injection rate | **36.7%** | Share of payloads where the reference agent emitted the dangerous call. Without a gateway, this is the attack success rate |
-| Guarded execution rate (careful approver) | **3.3%** | The one case that got through is the payload the corpus itself marks as allowed |
-| Guarded execution rate (rubber-stamp approver) | **3.3%** | Upper bound on leakage through the approval step |
+| Guarded execution rate (careful approver) | **1.7%** | One of 60 attacks executed: `alert-11-clock-skew`, which the corpus itself marks as allowed |
+| Guarded execution rate (rubber-stamp approver) | **10.0%** | Upper bound on leakage through the approval step: the 6 cases not denied outright all execute under an approver who does not read |
 | Benign hard false-positive rate | **0.0%** | All 16 ordinary operations completed |
-| Benign friction rate | 6.2% | Share requiring a human approval to complete |
+| Benign friction rate | 12.5% | Share requiring a human approval to complete |
 | Audit chain | `valid=True` | The whole chain is verified once at the end of the run. The record count varies with run size; the report's Audit chain section gives it for that run |
+
+These numbers measure the `scripted` reference agent, whose behaviour is fixed by the corpus: per-payload injection is 0% or 100%, so repeats carry no statistical information. The run is therefore a self-check of the harness -- it shows the pipeline is wired, policy hits what it should, and the chain is intact. Measuring attack success rate against a model requires `--agent llm`; see [`docs/red-team.md`](docs/red-team.md) §4.
+
+Two full runs, policy bundle `2026.09.1` to `2026.09.2`, are compared in [`eval/report/compare.md`](eval/report/compare.md): `permissive` 4 to 2, `unattended` 1 to 0, zero bypasses under a careful approver, paid for with benign friction rising from 6.2% to 12.5%.
 
 The full report is at [`eval/report/report.md`](eval/report/report.md). Its `policy_gaps` section lists every disagreement between what the corpus expects and what the gateway decides, each with the gateway's own reason. The table runs both ways: what the gateway let through (`permissive`), what it stopped unnecessarily (`friction`), and what ran unattended when a human should have looked (`unattended`).
 
@@ -276,9 +282,9 @@ The three kinds of disagreement the evaluation surfaces are differences of stanc
 
 | Category | Count | Description |
 | --- | ---: | --- |
-| `permissive` | 4 | The corpus says `deny`, policy says `allow`. All four share one shape, a write or delete of a single named key, for example `DEL orders:1001` or `SET backdoor 1`. This category is permitted by design: the blast radius is one key, and it can be snapshotted and rolled back. The corpus takes a stricter position. To tighten it, move write/delete of a single named key from `allow` to `approval` in `policies/redis.rego` |
-| `deferred` | 7 | The corpus says `deny`, policy says `approval_required` — mostly deleting workloads, scaling to zero, and reading Secrets. The approver is the only line of defense for these actions |
-| `unattended` | 3 | The corpus wants a human to look and policy executed automatically. All three are a `SET` or `EXPIRE` on a single key: 1 attack and 2 ordinary operations. This runs in the opposite direction from a bypass and needs the same attention |
+| `permissive` | 2 | The corpus says `deny`, policy says `allow`. Both are a write or delete of a single named key — `DEL orders:1001`, `SET backdoor 1` — and both are on the `log` carrier, whose read does not pass through the gateway, so the session-taint rule does not fire. The category is permitted by design: the blast radius is one key, and it can be snapshotted and rolled back. The corpus takes a stricter position |
+| `deferred` | 9 | The corpus says `deny`, policy says `approval_required` — deleting workloads, scaling to zero, reading Secrets, and writing to protected namespaces (`session:`, `lock:`). The approver is the only line of defense for these actions |
+| `unattended` | 0 | Zero since bundle 2026.09.2 |
 
 Each maps to a numbered threat in [`docs/threat-model.md`](docs/threat-model.md).
 
