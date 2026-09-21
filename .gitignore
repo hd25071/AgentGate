@@ -24,12 +24,17 @@ _smoke/
 .env.*.local
 
 # --- evaluation artefacts -------------------------------------------------
-# The harness writes these on every run. The frozen sample report is committed
-# on purpose so the numbers in the README can be checked without rerunning;
-# everything else is regenerated.
+# The harness writes these on every run. The frozen reports are committed on
+# purpose so the numbers in the README can be checked without rerunning: the
+# current one, the one from before a policy change (so a before/after claim is
+# checkable rather than taken on trust), and the comparison between them.
+# Everything else -- the .json in particular, which carries every sample -- is
+# regenerated and is not worth 100KB of history per run.
 eval/report/*.json
 eval/report/*.md
 !eval/report/report.md
+!eval/report/report-v1.md
+!eval/report/compare.md
 
 # --- tooling / editor -----------------------------------------------------
 __pycache__/

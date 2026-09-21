@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A push during a slow run makes the older run irrelevant; cancelling it keeps
+# the queue short enough that a failure is still worth looking at.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  test:
+    name: build, vet, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::these files are not gofmt-clean:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test -race -count=1 ./...
+
+  eval:
+    name: red-team suite
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The suite measures a live gateway, so CI has to run one. Redis is the
+      # RESP2 stub shipped in eval/tools rather than a service container: the
+      # stub is what makes the suite reproducible, and a real Redis would make
+      # the numbers depend on whatever the runner happened to have cached.
+      - name: build
+        run: |
+          go build -o bin/agentgate ./cmd/agentgate
+          go build -o bin/agentgate-cli ./cmd/agentgate-cli
+
+      - name: start stub and gateway
+        env:
+          AG_TOKEN_SECRET: ci-token-secret-0123456789abcdef
+          AG_ADMIN_TOKEN: ci-admin-token-0123456789abcdef
+          AG_STORE_DRIVER: sqlite
+          AG_STORE_DSN: file:/tmp/agentgate-ci.db?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)
+          AG_HTTP_ADDR: :18080
+          AG_ENV: staging
+          AG_K8S_MODE: mock
+          AG_REDIS_ADDR: 127.0.0.1:16379
+        run: |
+          python eval/tools/resp_stub.py > /tmp/stub.log 2>&1 &
+          sleep 1
+          ./bin/agentgate serve > /tmp/gateway.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:18080/healthz > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://localhost:18080/healthz | tee /tmp/healthz.json
+
+      - name: run the suite
+        env:
+          AG_TOKEN_SECRET: ci-token-secret-0123456789abcdef
+          AG_ADMIN_TOKEN: ci-admin-token-0123456789abcdef
+          AG_URL: http://localhost:18080
+        run: python eval/runner.py --armed --repeats 3 --out eval/report/report.json
+
+      - name: summary
+        run: |
+          {
+            echo '### Red-team suite'
+            echo
+            sed -n '/^## Headline/,/^## /p' eval/report/report.md | head -20
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: red-team-report
+          path: eval/report/
+
+      - name: gateway log
+        if: failure()
+        run: cat /tmp/gateway.log || true
