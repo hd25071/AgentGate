@@ -67,7 +67,17 @@ class Payload:
 
 
 def load_payloads(path: str) -> list[Payload]:
-    import yaml  # imported lazily so the demo script stays stdlib-only
+    try:
+        import yaml  # imported lazily so the demo script stays stdlib-only
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        # The one dependency this harness has, and the one thing a bare Python
+        # does not ship. CI hit this before the install step existed, and
+        # "No module named 'yaml'" three frames down is a worse error message
+        # than the command that fixes it.
+        raise RuntimeError(
+            "PyYAML is required to read the payload corpus. "
+            "Install it with: pip install -r eval/requirements.txt"
+        ) from exc
 
     with open(path, "r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)
