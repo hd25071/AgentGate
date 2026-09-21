@@ -34,6 +34,7 @@ eval/report/*.json
 eval/report/*.md
 !eval/report/report.md
 !eval/report/report-v1.md
+!eval/report/report-llm.md
 !eval/report/compare.md
 
 # --- tooling / editor -----------------------------------------------------
