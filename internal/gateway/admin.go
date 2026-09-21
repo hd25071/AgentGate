@@ -47,6 +47,7 @@ func (g *Gateway) Routes() http.Handler {
 
 	mux.Handle("GET /admin/policies", g.admin(g.handlePolicies))
 	mux.Handle("GET /admin/tokens", g.admin(g.handleTokenHelp))
+	mux.Handle("POST /admin/simulator/reseed", g.admin(g.handleReseedSimulator))
 
 	// The UI shell is served without the admin wrapper, deliberately. A browser
 	// navigating to /admin/ui has nowhere to put an X-Admin-Token header, so
@@ -320,6 +321,33 @@ func (g *Gateway) handleTokenHelp(w http.ResponseWriter, r *http.Request) {
 		"scopes":     auth.KnownScopes(),
 		"issue_with": "agentgate-cli token issue --subject <name> --scopes <a,b> --ttl 1h",
 		"note":       "the gateway holds kubeconfig, Redis credentials and device credentials; agents hold only these scopes",
+	})
+}
+
+// handleReseedSimulator puts the in-memory Kubernetes simulator back to its
+// documented starting inventory.
+//
+// Only the red-team harness needs this, and only so that its numbers mean
+// something: a payload that deletes a Deployment would otherwise succeed on the
+// first repeat and report "not found" on the rest, and the guarded-execution
+// rate would measure payload ordering instead of policy. It is refused on a
+// cluster-mode gateway rather than being made a no-op, because the one thing
+// worse than a harness that cannot reseed is a harness that believes it did.
+func (g *Gateway) handleReseedSimulator(w http.ResponseWriter, r *http.Request) {
+	if g.cfg.K8s.Mode != "mock" {
+		writeProblem(w, http.StatusNotFound, "no simulator to reseed",
+			fmt.Sprintf("the Kubernetes adapter is in %q mode; a real cluster cannot be restored to a checkpoint", g.cfg.K8s.Mode))
+		return
+	}
+	if !g.adapters.ReseedSimulator() {
+		writeProblem(w, http.StatusNotFound, "no simulator to reseed",
+			"no in-memory Kubernetes adapter is registered")
+		return
+	}
+	g.log.Info("simulator reseeded", "by", "admin-api")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"reseeded": true,
+		"note":     "the in-memory cluster is back to its seeded inventory; audit records are untouched",
 	})
 }
 

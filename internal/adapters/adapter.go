@@ -122,6 +122,22 @@ func (r *Registry) HealthAll(ctx context.Context) map[string]string {
 	return out
 }
 
+// ReseedSimulator restores the in-memory Kubernetes simulator, if one is
+// registered. Returns false when the registered adapter is a real cluster, so
+// the caller can say "not a simulator" instead of pretending it worked.
+func (r *Registry) ReseedSimulator() bool {
+	a, ok := r.byKind[action.KindK8s]
+	if !ok {
+		return false
+	}
+	m, ok := a.(*MockK8sAdapter)
+	if !ok {
+		return false
+	}
+	m.Reseed()
+	return true
+}
+
 // ---------------------------------------------------------------------------
 // Result sanitization
 // ---------------------------------------------------------------------------

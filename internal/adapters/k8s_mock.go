@@ -152,6 +152,25 @@ func (m *MockK8sAdapter) seed() {
 
 func (m *MockK8sAdapter) Health(ctx context.Context) error { return nil }
 
+// Reseed restores the simulator to its documented starting inventory.
+//
+// This exists because a destructive measurement is only valid if every sample
+// starts from the same state. The red-team harness deletes Deployments; without
+// a reseed the first repeat of a payload succeeds and the rest fail with
+// "not found", which reads as the gateway blocking the action when what
+// actually happened is that the target was already gone. That makes the
+// guarded-execution rate a function of payload ordering rather than of policy.
+//
+// It is deliberately not part of the Adapter interface: a real cluster cannot
+// be reseeded, and an operator who finds this on a cluster-mode gateway should
+// get a clean "not a simulator" rather than a silently truncated command.
+func (m *MockK8sAdapter) Reseed() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.objects = map[string]map[string]any{}
+	m.seed()
+}
+
 func (m *MockK8sAdapter) lookup(kind, ns, name string) (map[string]any, bool) {
 	obj, ok := m.objects[key(kind, ns, name)]
 	return obj, ok

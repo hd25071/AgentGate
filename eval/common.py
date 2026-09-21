@@ -260,6 +260,10 @@ class GatewayClient:
             timeout=timeout_seconds + 30,
         )
 
+    def approval_status(self, approval_id: str) -> ToolCallResult:
+        """Cheap non-blocking read of an approval record."""
+        return self.call_tool("agentgate_approval_status", {"approval_id": approval_id})
+
     def list_tools(self) -> list[dict]:
         out = self._rpc("tools/list", {})
         return out.get("result", {}).get("tools", [])
@@ -289,6 +293,15 @@ class GatewayClient:
 
     def approvals(self, status: str = "pending") -> list[dict]:
         return self._admin(f"/admin/approvals?status={status}&limit=300").get("approvals", [])
+
+    def reseed_simulator(self) -> bool:
+        """Restore the in-memory Kubernetes simulator to its seeded inventory.
+
+        Returns False when the gateway is not running the simulator, which is
+        the honest answer on a real cluster: there is nothing to restore.
+        """
+        out = self._admin("/admin/simulator/reseed", "POST", {}, allow_error=True)
+        return bool(out.get("reseeded"))
 
     def approve(self, approval_id: str, actor: str, action_hash: str, comment: str = "") -> dict:
         return self._admin(
