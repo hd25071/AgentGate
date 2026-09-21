@@ -384,6 +384,17 @@ class Runner:
         lines.append(f"- gateway: {meta['gateway_url']}  policy={meta['policy_version']}")
         lines.append(f"- agent under test: `{meta['agent']}`")
         lines.append(f"- payloads: {o['payloads']}  repeats each: {meta['repeats']}")
+        if meta.get("temperature") is not None:
+            lines.append(f"- decoding: temperature={meta['temperature']}  max_tokens={meta.get('max_tokens')}")
+        if meta.get("payload_errors"):
+            # Stated at the top, not buried: every rate below is over the
+            # payloads that completed, and a reader is entitled to know that
+            # some did not.
+            lines.append(
+                f"- incomplete: **{len(meta['payload_errors'])} of "
+                f"{meta.get('payloads_attempted', o['payloads'])} payloads failed** and are "
+                f"excluded -- see Run errors"
+            )
         lines.append("")
         lines.append("## Headline")
         lines.append("")
@@ -539,6 +550,21 @@ class Runner:
                     f"| `{g['id']}` | {g['expect']} | {g['verdict']} | {g['kind']} | {why.replace('|', '/')} |"
                 )
             lines.append("")
+
+        if meta.get("payload_errors"):
+            lines.append("## Run errors")
+            lines.append("")
+            lines.append(
+                "These payloads raised instead of completing. They are excluded from every "
+                "rate above, so the run is partial and says so rather than reporting a "
+                "clean number over fewer samples than it claims."
+            )
+            lines.append("")
+            lines.append("| id | error |")
+            lines.append("| --- | --- |")
+            for e in meta["payload_errors"]:
+                lines.append(f"| `{e['id']}` | {e['error'].replace('|', '/')} |")
+            lines.append("")
         return "\n".join(lines)
 
 
@@ -581,10 +607,22 @@ def main() -> int:
 
     print(f"loaded {len(payloads)} attack payloads and {len(benign)} benign tasks")
 
+    # One payload raising must not cost the whole run. A 60-payload sweep
+    # against a real model takes half an hour; losing all of it to a single
+    # transport hiccup on payload 41 is how a harness quietly stops being run.
+    # Failures are collected and printed in the report instead, so a partial
+    # run is visibly partial rather than silently rounded up.
+    errors: list[dict] = []
+
     results: list[PayloadResult] = []
     started = time.time()
     for i, p in enumerate(payloads, 1):
-        res = runner.run_payload(p)
+        try:
+            res = runner.run_payload(p)
+        except Exception as exc:
+            errors.append({"id": p.id, "error": f"{type(exc).__name__}: {exc}"})
+            print(f"  [{i}/{len(payloads)}] {p.id:<38} ERROR {type(exc).__name__}: {exc}")
+            continue
         results.append(res)
         print(f"  [{i}/{len(payloads)}] {p.id:<38} policy={res.policy_verdict:<18} "
               f"inject={pct(res.emitted, res.repeats)}% guarded={pct(res.guarded_executed, res.repeats)}%")
@@ -592,7 +630,10 @@ def main() -> int:
     benign_results = []
     if not args.skip_benign:
         for p in benign:
-            benign_results.append(runner.run_benign(p))
+            try:
+                benign_results.append(runner.run_benign(p))
+            except Exception as exc:
+                errors.append({"id": p.id, "error": f"{type(exc).__name__}: {exc}"})
         print(f"  ran {len(benign_results)} benign tasks")
 
     summary = runner.summarise(results, benign_results)
@@ -608,8 +649,18 @@ def main() -> int:
         "gateway_version": health.get("version"),
         "policy_version": health.get("policy"),
         "agent": runner.agent.name,
+        # Reported because the note below insists on it: an LLM sample count is
+        # meaningless without the decoding settings behind it. temperature is
+        # None for the scripted agent, which is deterministic by construction.
+        "temperature": getattr(runner.agent, "temperature", None),
+        "max_tokens": getattr(runner.agent, "max_tokens", None),
         "repeats": args.repeats,
         "armed": args.armed,
+        # A run that lost payloads has to say so in the artefact, not just on
+        # stdout: the .json is what gets compared against other runs.
+        "payloads_attempted": len(payloads) + len(benign),
+        "payloads_completed": len(results) + len(benign_results),
+        "payload_errors": errors,
         "elapsed_s": round(time.time() - started, 1),
         "note": (
             "Injection rate is the fraction of runs in which the agent under test emitted the "

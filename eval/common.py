@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import time
 import unicodedata
 import urllib.error
@@ -185,6 +186,22 @@ class ToolCallResult:
         return d
 
 
+def _is_transient(exc: BaseException) -> bool:
+    """True for failures worth retrying: the connection broke, nothing more.
+
+    A reset connection is not a verdict. The gateway did not refuse the call, it
+    never got it, so the only honest thing to do is ask again. Anything that
+    looks like an answer -- an HTTP status, a policy decision -- is not retried.
+    """
+    if isinstance(exc, urllib.error.URLError):
+        exc = exc.reason
+    return isinstance(exc, (ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout))
+
+
+def _backoff(attempt: int) -> None:
+    time.sleep(1.0 * (attempt + 1))
+
+
 class GatewayClient:
     """Talks to the AgentGate HTTP surface."""
 
@@ -196,7 +213,7 @@ class GatewayClient:
 
     # -- MCP ---------------------------------------------------------------
 
-    def _rpc(self, method: str, params: dict, timeout: int = 60) -> dict:
+    def _rpc(self, method: str, params: dict, timeout: int = 60, retries: int = 0) -> dict:
         self._rpc_id += 1
         body = json.dumps(
             {"jsonrpc": "2.0", "id": f"eval-{self._rpc_id}", "method": method, "params": params}
@@ -210,8 +227,17 @@ class GatewayClient:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
+        # retries defaults to 0: tools/call has side effects, and a request that
+        # may have been executed must not be sent twice. Callers that only read
+        # pass a higher value.
+        for attempt in range(retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode())
+            except Exception as exc:
+                if attempt >= retries or not _is_transient(exc):
+                    raise
+                _backoff(attempt)
 
     def call_tool(self, tool: str, arguments: dict, timeout: int = 60) -> ToolCallResult:
         started = time.time()
@@ -265,13 +291,13 @@ class GatewayClient:
         return self.call_tool("agentgate_approval_status", {"approval_id": approval_id})
 
     def list_tools(self) -> list[dict]:
-        out = self._rpc("tools/list", {})
+        out = self._rpc("tools/list", {}, retries=2)
         return out.get("result", {}).get("tools", [])
 
     # -- admin -------------------------------------------------------------
 
     def _admin(self, path: str, method: str = "GET", body: dict | None = None,
-               timeout: int = 20, allow_error: bool = False):
+               timeout: int = 20, allow_error: bool = False, retries: int = 0):
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(
             self.base + path,
@@ -279,20 +305,29 @@ class GatewayClient:
             headers={"X-Admin-Token": self.admin_token, "Content-Type": "application/json"},
             method=method,
         )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode())
-        except urllib.error.HTTPError as exc:
-            payload = exc.read().decode(errors="replace")
-            if allow_error:
-                try:
-                    return json.loads(payload)
-                except Exception:
-                    return {"error": payload}
-            raise RuntimeError(f"{method} {path} -> {exc.code}: {payload[:200]}")
+        # Defaults to no retry. Approving, rejecting and replaying are all
+        # one-way doors; only the read-only and reset-to-known-state calls below
+        # opt in. urllib reuses the Request object across attempts, which is
+        # safe here because the body is replayed from `data`, not a stream.
+        for attempt in range(retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode())
+            except urllib.error.HTTPError as exc:
+                payload = exc.read().decode(errors="replace")
+                if allow_error:
+                    try:
+                        return json.loads(payload)
+                    except Exception:
+                        return {"error": payload}
+                raise RuntimeError(f"{method} {path} -> {exc.code}: {payload[:200]}")
+            except Exception as exc:
+                if attempt >= retries or not _is_transient(exc):
+                    raise
+                _backoff(attempt)
 
     def approvals(self, status: str = "pending") -> list[dict]:
-        return self._admin(f"/admin/approvals?status={status}&limit=300").get("approvals", [])
+        return self._admin(f"/admin/approvals?status={status}&limit=300", retries=2).get("approvals", [])
 
     def reseed_simulator(self) -> bool:
         """Restore the in-memory Kubernetes simulator to its seeded inventory.
@@ -300,7 +335,7 @@ class GatewayClient:
         Returns False when the gateway is not running the simulator, which is
         the honest answer on a real cluster: there is nothing to restore.
         """
-        out = self._admin("/admin/simulator/reseed", "POST", {}, allow_error=True)
+        out = self._admin("/admin/simulator/reseed", "POST", {}, allow_error=True, retries=2)
         return bool(out.get("reseeded"))
 
     def approve(self, approval_id: str, actor: str, action_hash: str, comment: str = "") -> dict:
@@ -323,11 +358,17 @@ class GatewayClient:
         return self._admin(f"/admin/replay/{request_id}", allow_error=True)
 
     def verify_chain(self) -> dict:
-        return self._admin("/admin/audit/verify", allow_error=True)
+        return self._admin("/admin/audit/verify", allow_error=True, retries=2)
 
     def health(self) -> dict:
-        with urllib.request.urlopen(self.base + "/healthz", timeout=10) as resp:
-            return json.loads(resp.read().decode())
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(self.base + "/healthz", timeout=10) as resp:
+                    return json.loads(resp.read().decode())
+            except Exception as exc:
+                if attempt >= 2 or not _is_transient(exc):
+                    raise
+                _backoff(attempt)
 
 
 # ---------------------------------------------------------------------------
@@ -371,3 +412,36 @@ def sha(text: str) -> str:
 
 def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
+
+
+def load_local_env() -> str | None:
+    """Fill in settings from a git-ignored .env.local if one exists.
+
+    Only used for things the harness cannot know: an LLM endpoint and its key.
+    Variables already present in the environment win, so an explicit export on
+    the command line still overrides the file. Returns the path read, or None.
+
+    Looked for in eval/ first, then the repository root. Both are covered by
+    .gitignore -- the point is that a key typed into a file never reaches git
+    and never has to be pasted into a terminal or a chat window.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (
+        os.path.join(here, ".env.local"),
+        os.path.join(os.path.dirname(here), ".env.local"),
+    ):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            name, value = name.strip(), value.strip().strip('"').strip("'")
+            if name and name not in os.environ:
+                os.environ[name] = value
+        return path
+    return None

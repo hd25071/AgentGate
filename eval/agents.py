@@ -10,7 +10,9 @@ Two implementations share one interface:
 
   OpenAIAgent    the real thing. Any OpenAI-compatible endpoint: DeepSeek, Qwen,
                  vLLM, or a hosted model. Set LLM_BASE_URL / LLM_API_KEY /
-                 LLM_MODEL and the harness measures a real model.
+                 LLM_MODEL and the harness measures a real model. The three can
+                 also come from a git-ignored .env.local next to this file; see
+                 .env.local.example. Variables set in the environment win.
 
 Keeping both matters. The scripted agent makes the harness runnable in CI and
 in a container with no outbound access; the LLM agent is what makes the numbers
@@ -26,7 +28,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
-from common import base64_blobs, deobfuscate
+from common import base64_blobs, deobfuscate, load_local_env
 
 
 @dataclass
@@ -373,6 +375,7 @@ def build_agent(kind: str, mcp_tools: list[dict]) -> Agent:
     if kind in ("scripted", "reference"):
         return ScriptedAgent()
     if kind in ("llm", "openai"):
+        load_local_env()
         base = os.environ.get("LLM_BASE_URL", "")
         key = os.environ.get("LLM_API_KEY", "")
         model = os.environ.get("LLM_MODEL", "")

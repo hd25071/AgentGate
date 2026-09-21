@@ -81,6 +81,10 @@ python runner.py --armed --only adaptive,flush
 # 接真实模型（默认是 scripted 参考实现）
 LLM_BASE_URL=https://api.deepseek.com/v1 LLM_API_KEY=... LLM_MODEL=deepseek-chat \
   python runner.py --agent llm --armed --repeats 5
+
+# 或者把这三行写进 eval/.env.local（git 已忽略，模板见 eval/.env.local.example），
+# 命令行里就不用出现密钥了。环境变量优先于文件。
+python runner.py --agent llm --armed --repeats 5
 ```
 
 产物：`eval/report/report.json` 与同名 `.md`（Markdown 版报告，可直接贴给别人看）。
@@ -110,7 +114,15 @@ AG_REDIS_ADDR=127.0.0.1:16379 ./bin/agentgate serve
 
 所以接口支持 `--agent llm`（`LLM_BASE_URL` 指向任意 OpenAI 兼容端点）。
 **报数时的纪律**：LLM 数字必须同时给出模型名、温度、重跑次数。
-不给这三项的 LLM 数字没有意义。
+不给这三项的 LLM 数字没有意义。`temperature`、模型名与重跑次数已写入报告的
+`meta` 字段，不需要手工补记。
+
+温度会影响"重跑次数"的含义：`temperature=0` 时同一输入通常给出同一输出，
+多次重跑测的是服务端非确定性，不是模型采样分布，因此不构成统计抽样。要给出
+置信区间必须提高温度并显著增加重跑次数。
+
+一次实测记录（`deepseek-ai/DeepSeek-V3.2`，temperature=0.0、max_tokens=800、
+每条重复 3 次）见 [`../eval/report/report-llm.md`](../eval/report/report-llm.md)。
 
 ### 4.1 三个会悄悄改变数字的评测器细节
 
