@@ -1,0 +1,16 @@
+.git
+.gitignore
+bin
+dist
+data
+var
+*.db
+*.sqlite
+.env
+eval/report
+__pycache__
+**/__pycache__
+*.pyc
+.venv
+_probe.txt
+docs

@@ -1,0 +1,194 @@
+name: agentgate
+
+# Everything runs with `docker compose up`. Two services are the point of the
+# exercise -- a real Redis the gateway can actually talk to, and the gateway
+# itself. The rest are profiles you opt into:
+#
+#   docker compose up -d                      gateway + redis + postgres
+#   docker compose --profile demo run --rm demo
+#   docker compose --profile eval run --rm eval
+#   docker compose --profile observability up -d
+
+services:
+  agentgate:
+    build:
+      context: .
+      args:
+        # Substitute a mirror here if Docker Hub is not reachable:
+        #   GO_IMAGE=docker.m.daocloud.io/library/golang:1.26-alpine
+        # Must be >= the `go` directive in go.mod.
+        GO_IMAGE: ${GO_IMAGE:-golang:1.26-alpine}
+        ALPINE_IMAGE: ${ALPINE_IMAGE:-alpine:3.20}
+    image: agentgate:dev
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      AG_HTTP_ADDR: ":8080"
+      AG_TOKEN_SECRET: ${AG_TOKEN_SECRET:?set AG_TOKEN_SECRET in .env}
+      AG_ADMIN_TOKEN: ${AG_ADMIN_TOKEN:?set AG_ADMIN_TOKEN in .env}
+      AG_TOKEN_TTL: ${AG_TOKEN_TTL:-1h}
+      AG_ENV: ${AG_ENV:-staging}
+
+      AG_STORE_DRIVER: postgres
+      AG_STORE_DSN: postgres://agentgate:agentgate@postgres:5432/agentgate?sslmode=disable
+
+      AG_POLICY_DIR: ${AG_POLICY_DIR:-}
+
+      AG_APPROVAL_TTL: ${AG_APPROVAL_TTL:-30m}
+      AG_APPROVAL_WEBHOOK_URL: ${AG_APPROVAL_WEBHOOK_URL:-}
+      AG_APPROVAL_WEBHOOK_SHAPE: ${AG_APPROVAL_WEBHOOK_SHAPE:-generic}
+
+      AG_REDIS_NAME: redis-primary
+      AG_REDIS_ADDR: redis:6379
+      AG_REDIS_PASSWORD: ${AG_REDIS_PASSWORD:-}
+
+      AG_K8S_MODE: ${AG_K8S_MODE:-mock}
+      AG_K8S_NAME: k8s-cluster
+      AG_K8S_SERVER: ${AG_K8S_SERVER:-}
+      AG_K8S_TOKEN: ${AG_K8S_TOKEN:-}
+      AG_K8S_INSECURE: ${AG_K8S_INSECURE:-false}
+
+      AG_VRP_MODE: simulator
+
+      AG_NETGUARD_URL: ${AG_NETGUARD_URL:-}
+      AG_OTEL_ENDPOINT: ${AG_OTEL_ENDPOINT:-}
+      AG_OTEL_INSECURE: "true"
+      AG_LOG_FORMAT: json
+    ports:
+      - "${AG_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+      start_period: 5s
+    networks: [agentgate]
+
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agentgate
+      POSTGRES_PASSWORD: agentgate
+      POSTGRES_DB: agentgate
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentgate -d agentgate"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [agentgate]
+
+  # The target system, not part of AgentGate. It exists so the gateway has
+  # something real to read from and write to.
+  redis:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [agentgate]
+
+  # One-shot: seeds Redis with the fixture data the demo and eval assume.
+  seed:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    depends_on:
+      redis:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        redis-cli -h redis SET session:42 'user=alice;role=admin' >/dev/null
+        redis-cli -h redis SET session:43 'user=bob;role=user' >/dev/null
+        redis-cli -h redis SET cache:homepage '<html>ok</html>' >/dev/null
+        redis-cli -h redis HSET orders:1001 status paid total 4200 >/dev/null
+        redis-cli -h redis LPUSH queue:jobs job-1 job-2 job-3 >/dev/null
+        redis-cli -h redis SET feature:checkout_v2 off >/dev/null
+        echo "seeded $(redis-cli -h redis DBSIZE) keys"
+    networks: [agentgate]
+
+  # Walks the whole lifecycle against the running gateway and prints the audit
+  # chain at the end. This is the demo.
+  demo:
+    profiles: [demo]
+    image: ${PYTHON_IMAGE:-python:3.12-alpine}
+    depends_on:
+      agentgate:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    working_dir: /eval
+    volumes:
+      - ./eval:/eval:ro
+    environment:
+      AG_URL: http://agentgate:8080
+      AG_TOKEN_SECRET: ${AG_TOKEN_SECRET:?}
+      AG_ADMIN_TOKEN: ${AG_ADMIN_TOKEN:?}
+      AG_URL_INTERNAL: http://agentgate:8080
+    command: ["python", "demo.py"]
+
+  # The red-team harness. Runs the payload suite against the gateway, and
+  # against a bypass harness, then writes a report.
+  eval:
+    profiles: [eval]
+    build:
+      context: ./eval
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+    image: agentgate-eval:dev
+    depends_on:
+      agentgate:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    working_dir: /eval
+    volumes:
+      - ./eval:/eval
+    environment:
+      AG_URL: http://agentgate:8080
+      AG_TOKEN_SECRET: ${AG_TOKEN_SECRET:?}
+      AG_ADMIN_TOKEN: ${AG_ADMIN_TOKEN:?}
+      # Point at a real OpenAI-compatible endpoint for real-model runs:
+      #   LLM_BASE_URL=https://api.deepseek.com/v1 LLM_API_KEY=... LLM_MODEL=deepseek-chat
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      AG_EVAL_AGENT: ${AG_EVAL_AGENT:-scripted}
+      AG_EVAL_REPEATS: ${AG_EVAL_REPEATS:-3}
+    command: ["python", "runner.py", "--armed", "--repeats", "${AG_EVAL_REPEATS:-3}", "--out", "report/report.json"]
+
+  # Optional: traces, so the audit chain and the trace stream line up.
+  otel-collector:
+    profiles: [observability]
+    image: ${OTEL_IMAGE:-otel/opentelemetry-collector-contrib:0.111.0}
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ./deploy/otel-collector.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "4318:4318"
+    networks: [agentgate]
+
+  jaeger:
+    profiles: [observability]
+    image: ${JAEGER_IMAGE:-jaegertracing/all-in-one:1.60}
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+    networks: [agentgate]
+
+volumes:
+  pgdata:
+
+networks:
+  agentgate:
+    driver: bridge

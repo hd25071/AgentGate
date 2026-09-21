@@ -1,0 +1,187 @@
+# k3s manifests for a realistic deployment of the gateway.
+#
+# The gateway runs in-cluster with a projected, short-lived service-account
+# token, and its RBAC is deliberately narrow: it can read and patch the
+# workloads it is allowed to manage, and nothing else. Notably it has no
+# cluster-admin, no secrets access, and no node access -- an agent that talks an
+# operator into a bad change still cannot escalate through the gateway's own
+# identity.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agentgate
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agentgate
+  namespace: agentgate
+---
+# Read/write on the namespaces the gateway is allowed to touch.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agentgate-app
+  namespace: default
+rules:
+  - apiGroups: ["", "apps", "batch", "networking.k8s.io"]
+    resources:
+      - pods
+      - pods/log
+      - services
+      - configmaps
+      - deployments
+      - statefulsets
+      - daemonsets
+      - replicasets
+      - jobs
+      - cronjobs
+      - ingresses
+      - persistentvolumeclaims
+    verbs: ["get", "list", "watch", "patch", "update", "delete", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agentgate-app
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: agentgate
+    namespace: agentgate
+roleRef:
+  kind: Role
+  name: agentgate-app
+  apiGroup: rbac.authorization.k8s.io
+---
+# Namespace reads are needed to answer "does this namespace exist", nothing more.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agentgate-namespace-reader
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+  # Discovery is how the adapter resolves CRD kinds.
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agentgate-namespace-reader
+subjects:
+  - kind: ServiceAccount
+    name: agentgate
+    namespace: agentgate
+roleRef:
+  kind: ClusterRole
+  name: agentgate-namespace-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentgate
+  namespace: agentgate
+  labels: {app: agentgate}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: agentgate}
+  template:
+    metadata:
+      labels: {app: agentgate}
+    spec:
+      serviceAccountName: agentgate
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: agentgate
+          image: agentgate:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - name: AG_HTTP_ADDR
+              value: ":8080"
+            - name: AG_ENV
+              value: prod
+            - name: AG_STORE_DRIVER
+              value: postgres
+            - name: AG_STORE_DSN
+              valueFrom:
+                secretKeyRef: {name: agentgate-secrets, key: store-dsn}
+            - name: AG_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef: {name: agentgate-secrets, key: token-secret}
+            - name: AG_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef: {name: agentgate-secrets, key: admin-token}
+            - name: AG_REDIS_ADDR
+              value: redis-primary.default.svc:6379
+            - name: AG_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: agentgate-secrets, key: redis-password}
+            - name: AG_K8S_MODE
+              value: cluster
+            - name: AG_K8S_NAME
+              value: k3s-prod
+            - name: AG_VRP_MODE
+              value: simulator
+            - name: AG_OTEL_ENDPOINT
+              value: otel-collector.observability.svc:4318
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          # readyz re-verifies the audit hash chain, so a corrupted chain takes
+          # the pod out of rotation instead of quietly serving.
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentgate
+  namespace: agentgate
+spec:
+  selector: {app: agentgate}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+# Replace the placeholder values before applying:
+#   kubectl -n agentgate create secret generic agentgate-secrets \
+#     --from-literal=token-secret="$(openssl rand -hex 32)" \
+#     --from-literal=admin-token="$(openssl rand -hex 32)" \
+#     --from-literal=store-dsn="postgres://..." \
+#     --from-literal=redis-password="..."
+apiVersion: v1
+kind: Secret
+metadata:
+  name: agentgate-secrets
+  namespace: agentgate
+type: Opaque
+stringData:
+  token-secret: "REPLACE_ME"
+  admin-token: "REPLACE_ME"
+  store-dsn: "postgres://agentgate:agentgate@postgres.default.svc:5432/agentgate?sslmode=disable"
+  redis-password: ""

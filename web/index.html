@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AgentGate 审批与回放</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#ffffff; --border:#e3e6ea; --text:#1c2024; --muted:#656d76;
+    --accent:#2f5fd0; --accent-weak:#eaf0fc;
+    --crit:#b3261e; --crit-bg:#fdecea; --high:#a05a00; --high-bg:#fdf3e3;
+    --ok:#1a7f43; --ok-bg:#eaf7ee; --chip:#eef1f5;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  header{background:var(--panel);border-bottom:1px solid var(--border);padding:14px 22px;
+         display:flex;align-items:center;gap:16px;flex-wrap:wrap;position:sticky;top:0;z-index:5}
+  header h1{font-size:15px;margin:0;font-weight:650;letter-spacing:.2px}
+  header .spacer{flex:1}
+  .badge{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;
+         background:var(--chip);font-size:12px;color:var(--muted)}
+  .badge b{color:var(--text);font-weight:600}
+  main{max-width:1180px;margin:0 auto;padding:22px}
+  .tabs{display:flex;gap:6px;margin-bottom:16px}
+  .tabs button{border:1px solid var(--border);background:var(--panel);color:var(--muted);
+               padding:7px 14px;border-radius:8px;cursor:pointer;font-size:13px}
+  .tabs button.active{background:var(--accent-weak);border-color:#c6d6f7;color:var(--accent);font-weight:600}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px}
+  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  .row.between{justify-content:space-between}
+  .muted{color:var(--muted);font-size:12.5px}
+  code,.mono{font-family:var(--mono);font-size:12.5px}
+  code{background:var(--chip);padding:1px 5px;border-radius:4px;word-break:break-all}
+  .risk{font-size:11.5px;font-weight:650;padding:2px 8px;border-radius:6px;text-transform:uppercase;letter-spacing:.4px}
+  .risk.critical{background:var(--crit-bg);color:var(--crit)}
+  .risk.high{background:var(--high-bg);color:var(--high)}
+  .risk.medium{background:#eef1f5;color:#4a5259}
+  .risk.low,.risk.unknown{background:var(--ok-bg);color:var(--ok)}
+  .status{font-size:11.5px;font-weight:650;padding:2px 8px;border-radius:6px;background:var(--chip);color:#4a5259}
+  .status.pending{background:var(--high-bg);color:var(--high)}
+  .status.executed,.status.approved{background:var(--ok-bg);color:var(--ok)}
+  .status.rejected,.status.expired,.status.failed{background:var(--crit-bg);color:var(--crit)}
+  h3{margin:0 0 6px;font-size:14.5px;font-weight:650}
+  ul.reasons{margin:8px 0 0;padding-left:18px}
+  ul.reasons li{margin:2px 0;font-size:13px}
+  ul.flags{list-style:none;margin:8px 0 0;padding:0;display:flex;gap:6px;flex-wrap:wrap}
+  ul.flags li{font-size:11.5px;background:var(--chip);color:var(--muted);padding:2px 7px;border-radius:5px}
+  button.act{border:1px solid var(--border);background:var(--panel);border-radius:7px;padding:6px 12px;
+             cursor:pointer;font-size:13px}
+  button.act.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+  button.act.danger{color:var(--crit);border-color:#f0c4bf}
+  button.act:disabled{opacity:.5;cursor:not-allowed}
+  input,textarea{font:inherit;padding:7px 9px;border:1px solid var(--border);border-radius:7px;background:#fff;width:100%}
+  input:focus,textarea:focus{outline:2px solid var(--accent-weak);border-color:var(--accent)}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--border);vertical-align:top}
+  th{color:var(--muted);font-weight:600;background:#fbfcfd;position:sticky;top:57px}
+  .empty{color:var(--muted);text-align:center;padding:34px;font-size:13px}
+  .field{margin-bottom:10px}
+  .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
+  .scroll{max-height:62vh;overflow:auto;border:1px solid var(--border);border-radius:10px;background:var(--panel)}
+  .warn{background:var(--high-bg);border:1px solid #f0dcb8;color:#6b4700;border-radius:8px;
+        padding:9px 12px;font-size:12.5px;margin-bottom:12px}
+  details summary{cursor:pointer;color:var(--accent);font-size:12.5px}
+  pre{background:#fbfcfd;border:1px solid var(--border);border-radius:8px;padding:10px;
+      overflow:auto;font-family:var(--mono);font-size:12px;margin:8px 0 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>AgentGate · 审批与回放</h1>
+  <span class="badge">策略 <b id="policyVersion">–</b></span>
+  <span class="badge">审计链 <b id="chainState">–</b></span>
+  <span class="spacer"></span>
+  <input id="adminToken" type="password" placeholder="X-Admin-Token" style="width:210px" />
+  <button class="act" id="reload">刷新</button>
+</header>
+
+<main>
+  <div class="warn">
+    审批必须回填 <code>action_hash</code>。参数改动一个字节即产生新的 hash，原审批作废（防 TOCTOU）。
+    请求方不能自批；生产环境的删除类动作需要两人次。
+  </div>
+
+  <div class="tabs">
+    <button data-tab="approvals" class="active">待审批</button>
+    <button data-tab="audit">审计日志</button>
+    <button data-tab="replay">回放</button>
+    <button data-tab="health">运行状态</button>
+  </div>
+
+  <section id="tab-approvals">
+    <div class="row between" style="margin-bottom:10px">
+      <div class="muted" id="approvalCount">–</div>
+      <div class="row">
+        <select id="statusFilter" class="act" style="padding:6px 8px;border-radius:7px;border:1px solid var(--border)">
+          <option value="pending">pending</option>
+          <option value="executed">executed</option>
+          <option value="rejected">rejected</option>
+          <option value="expired">expired</option>
+          <option value="failed">failed</option>
+          <option value="all">all</option>
+        </select>
+      </div>
+    </div>
+    <div id="approvals"><div class="empty">加载中…</div></div>
+  </section>
+
+  <section id="tab-audit" hidden>
+    <div class="row between" style="margin-bottom:10px">
+      <div class="muted">最近的审计记录（哈希链，按 seq 递增）</div>
+      <button class="act" id="verifyBtn">校验整条链</button>
+    </div>
+    <div id="verifyOut"></div>
+    <div class="scroll"><table id="auditTable">
+      <thead><tr><th style="width:64px">seq</th><th style="width:168px">type</th><th style="width:210px">request_id</th><th>payload</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+
+  <section id="tab-replay" hidden>
+    <div class="card">
+      <div class="field">
+        <label>request_id（一次工具调用的全链路）</label>
+        <input id="replayId" placeholder="req_xxxxxxxxxxxx" />
+      </div>
+      <button class="act primary" id="replayBtn">回放</button>
+    </div>
+    <div id="replayOut"></div>
+  </section>
+
+  <section id="tab-health" hidden>
+    <div id="healthOut"><div class="empty">加载中…</div></div>
+  </section>
+</main>
+
+<script>
+(function () {
+  var tokenEl = document.getElementById('adminToken');
+  tokenEl.value = sessionStorage.getItem('ag_admin_token') || '';
+  tokenEl.addEventListener('change', function () { sessionStorage.setItem('ag_admin_token', tokenEl.value); refresh(); });
+
+  function headers() {
+    return { 'X-Admin-Token': tokenEl.value, 'Content-Type': 'application/json' };
+  }
+  function api(path, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign(headers(), opts.headers || {});
+    return fetch(path, opts).then(function (r) {
+      return r.text().then(function (t) {
+        var body;
+        try { body = t ? JSON.parse(t) : {}; } catch (e) { body = { raw: t }; }
+        if (!r.ok) { throw new Error((body && (body.detail || body.title)) || r.statusText); }
+        return body;
+      });
+    });
+  }
+  function esc(s) {
+    return String(s === undefined || s === null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function shortHash(h) { return h ? h.slice(0, 22) + '…' : ''; }
+  function fmtTime(ms) { return ms ? new Date(ms).toLocaleString() : ''; }
+
+  // ---- tabs ----
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('.tabs button'));
+  tabs.forEach(function (b) {
+    b.addEventListener('click', function () {
+      tabs.forEach(function (x) { x.classList.toggle('active', x === b); });
+      ['approvals', 'audit', 'replay', 'health'].forEach(function (name) {
+        document.getElementById('tab-' + name).hidden = (name !== b.dataset.tab);
+      });
+      refresh();
+    });
+  });
+
+  var currentTab = 'approvals';
+
+  function refresh() {
+    var active = document.querySelector('.tabs button.active');
+    currentTab = active ? active.dataset.tab : 'approvals';
+    if (currentTab === 'approvals') loadApprovals();
+    if (currentTab === 'audit') loadAudit();
+    if (currentTab === 'health') loadHealth();
+  }
+
+  // ---- approvals ----
+  function loadApprovals() {
+    var status = document.getElementById('statusFilter').value;
+    document.getElementById('approvals').innerHTML = '<div class="empty">加载中…</div>';
+    api('/admin/approvals?status=' + encodeURIComponent(status) + '&limit=100').then(function (d) {
+      document.getElementById('approvalCount').textContent = d.count + ' 条';
+      if (!d.count) { document.getElementById('approvals').innerHTML = '<div class="empty">没有匹配的审批记录</div>'; return; }
+      document.getElementById('approvals').innerHTML = d.approvals.map(card).join('');
+      bindCards();
+    }).catch(function (e) {
+      document.getElementById('approvals').innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>';
+    });
+  }
+
+  function card(ap) {
+    var pending = ap.status === 'pending';
+    var votes = (ap.approvals || []).map(function (v) {
+      return '<span class="badge">' + (v.approve ? '✅' : '❌') + ' <b>' + esc(v.actor) + '</b>' + (v.comment ? ' · ' + esc(v.comment) : '') + '</span>';
+    }).join(' ');
+    var reasons = (ap.reasons || []).map(function (r) { return '<li>' + esc(r) + '</li>'; }).join('');
+    var flags = (ap.flags || []).map(function (f) { return '<li>' + esc(f) + '</li>'; }).join('');
+    var result = ap.result ? '<pre>' + esc(JSON.stringify(ap.result, null, 2)) + '</pre>' : '';
+    return '' +
+      '<div class="card" data-id="' + esc(ap.id) + '">' +
+        '<div class="row between">' +
+          '<div class="row">' +
+            '<span class="risk ' + esc(ap.risk) + '">' + esc(ap.risk) + '</span>' +
+            '<span class="status ' + esc(ap.status) + '">' + esc(ap.status) + '</span>' +
+            '<span class="muted">' + esc(ap.tool) + ' · Agent ' + esc(ap.subject) + ' · ' + fmtTime(ap.created_at) + '</span>' +
+          '</div>' +
+          '<span class="muted">' + esc(ap.required_approvals) + ' 人审批 · 超时 ' + fmtTime(ap.expires_at) + '</span>' +
+        '</div>' +
+        '<h3 style="margin-top:10px">' + esc(ap.summary) + '</h3>' +
+        (reasons ? '<ul class="reasons">' + reasons + '</ul>' : '') +
+        (flags ? '<ul class="flags">' + flags + '</ul>' : '') +
+        '<div class="muted" style="margin-top:8px">action_hash <code>' + esc(ap.action_hash) + '</code></div>' +
+        (votes ? '<div class="row" style="margin-top:8px">' + votes + '</div>' : '') +
+        (ap.decision_note ? '<div class="muted" style="margin-top:6px">' + esc(ap.decision_note) + '</div>' : '') +
+        (pending ? voteForm(ap) : '') +
+        '<details style="margin-top:10px"><summary>查看完整的 Action（策略实际判定的对象）</summary><pre>' + esc(pretty(ap.action_json)) + '</pre></details>' +
+        (result ? '<details style="margin-top:6px"><summary>执行结果</summary>' + result + '</details>' : '') +
+      '</div>';
+  }
+
+  function pretty(s) { try { return JSON.stringify(JSON.parse(s), null, 2); } catch (e) { return s; } }
+
+  function voteForm(ap) {
+    return '<div class="grid" style="margin-top:12px">' +
+      '<div class="field"><label>审批人</label><input class="v-actor" placeholder="your.name" /></div>' +
+      '<div class="field"><label>回填 action_hash（防先批后改）</label><input class="v-hash" placeholder="' + esc(ap.action_hash) + '" /></div>' +
+      '<div class="field"><label>备注</label><input class="v-comment" placeholder="变更单号 / 理由" /></div>' +
+      '</div>' +
+      '<div class="row" style="margin-top:4px">' +
+        '<button class="act primary v-approve">通过</button>' +
+        '<button class="act danger v-reject">驳回</button>' +
+      '</div>';
+  }
+
+  function bindCards() {
+    Array.prototype.slice.call(document.querySelectorAll('.card[data-id]')).forEach(function (el) {
+      var id = el.dataset.id;
+      var actor = el.querySelector('.v-actor');
+      var hash = el.querySelector('.v-hash');
+      var comment = el.querySelector('.v-comment');
+      function vote(approve) {
+        if (!actor.value) { alert('请填写审批人'); return; }
+        if (!hash.value) { alert('请回填 action_hash'); return; }
+        var btn = el.querySelector(approve ? '.v-approve' : '.v-reject');
+        btn.disabled = true;
+        api('/admin/approvals/' + encodeURIComponent(id) + (approve ? '/approve' : '/reject'), {
+          method: 'POST',
+          body: JSON.stringify({ actor: actor.value, action_hash: hash.value, comment: comment.value })
+        }).then(function () { loadApprovals(); })
+          .catch(function (e) { alert('失败：' + e.message); btn.disabled = false; });
+      }
+      var a = el.querySelector('.v-approve'), r = el.querySelector('.v-reject');
+      if (a) a.addEventListener('click', function () { vote(true); });
+      if (r) r.addEventListener('click', function () { vote(false); });
+    });
+  }
+
+  // ---- audit ----
+  function loadAudit() {
+    var tbody = document.querySelector('#auditTable tbody');
+    tbody.innerHTML = '<tr><td colspan="4" class="empty">加载中…</td></tr>';
+    api('/admin/audit?limit=300').then(function (d) {
+      tbody.innerHTML = d.records.map(function (r) {
+        return '<tr><td>' + r.seq + '</td><td><code>' + esc(r.type) + '</code></td>' +
+               '<td class="mono">' + esc(r.request_id) + '</td>' +
+               '<td><code style="background:none;padding:0">' + esc(r.payload) + '</code></td></tr>';
+      }).join('') || '<tr><td colspan="4" class="empty">暂无记录</td></tr>';
+    }).catch(function (e) { tbody.innerHTML = '<tr><td colspan="4" class="empty">加载失败：' + esc(e.message) + '</td></tr>'; });
+  }
+
+  document.getElementById('verifyBtn').addEventListener('click', function () {
+    var out = document.getElementById('verifyOut');
+    out.innerHTML = '<div class="empty">校验中…</div>';
+    api('/admin/audit/verify').then(function (r) {
+      out.innerHTML = '<div class="card"><b>✅ 哈希链完整</b><div class="muted">共 ' + r.length +
+        ' 条记录，head=' + esc(shortHash(r.head_hash)) + '</div></div>';
+    }).catch(function (e) {
+      out.innerHTML = '<div class="card" style="border-color:#f0c4bf"><b style="color:var(--crit)">❌ 哈希链校验失败</b><div class="muted">' +
+        esc(e.message) + '</div></div>';
+    });
+  });
+
+  // ---- replay ----
+  document.getElementById('replayBtn').addEventListener('click', function () {
+    var rid = document.getElementById('replayId').value.trim();
+    var out = document.getElementById('replayOut');
+    if (!rid) { out.innerHTML = '<div class="empty">请输入 request_id</div>'; return; }
+    out.innerHTML = '<div class="empty">加载中…</div>';
+    api('/admin/replay/' + encodeURIComponent(rid)).then(function (tl) {
+      if (!tl.records || !tl.records.length) { out.innerHTML = '<div class="empty">没有该 request 的记录</div>'; return; }
+      out.innerHTML =
+        '<div class="card"><div class="row between"><b>调用生命周期</b>' +
+        '<span class="badge">' + (tl.chain_verified ? '链完整' : '链异常：' + esc(tl.chain_problem)) + '</span></div></div>' +
+        tl.records.map(function (r) {
+          return '<div class="card"><div class="row between"><div class="row">' +
+            '<span class="badge">#' + r.seq + '</span><code>' + esc(r.type) + '</code>' +
+            '<span class="muted">' + fmtTime(r.ts) + '</span></div>' +
+            '<span class="muted mono">' + esc(shortHash(r.hash)) + '</span></div>' +
+            '<pre>' + esc(r.payload) + '</pre></div>';
+        }).join('');
+    }).catch(function (e) { out.innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>'; });
+  });
+
+  // ---- health ----
+  function loadHealth() {
+    var out = document.getElementById('healthOut');
+    api('/admin/policies').then(function (p) {
+      out.innerHTML = '<div class="card"><h3>策略包</h3>' +
+        '<div class="muted">版本 <code>' + esc(p.version) + '</code> · 来源 <code>' + esc(p.source) + '</code> · 引擎 ' + esc(p.engine) + '</div>' +
+        '<div class="muted" style="margin-top:6px">' + esc(p.note) + '</div></div>';
+    }).catch(function () {});
+    fetch('/healthz').then(function (r) { return r.json(); }).then(function (h) {
+      document.getElementById('policyVersion').textContent = h.policy || '–';
+      var adapters = Object.keys(h.adapters || {}).map(function (k) {
+        var ok = (h.adapters[k] || '').indexOf('ok') === 0;
+        return '<tr><td>' + esc(k) + '</td><td>' + (ok ? '✅ ok' : '⚠️ ' + esc(h.adapters[k])) + '</td></tr>';
+      }).join('');
+      document.getElementById('healthOut').innerHTML +=
+        '<div class="card"><h3>运行状态</h3><div class="muted">版本 ' + esc(h.version) +
+        ' · 环境 <code>' + esc(h.env) + '</code> · 运行 ' + h.uptime_s + 's</div>' +
+        '<table style="margin-top:10px"><thead><tr><th>目标系统</th><th>状态</th></tr></thead><tbody>' + adapters + '</tbody></table>' +
+        '<div class="muted" style="margin-top:10px">已注册工具：' + (h.tools || []).map(function (t) { return '<code>' + esc(t) + '</code>'; }).join(' ') + '</div></div>';
+    }).catch(function () {});
+  }
+
+  fetch('/admin/audit/verify', { headers: headers() })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (r) {
+      var el = document.getElementById('chainState');
+      if (!r) { el.textContent = '未校验'; return; }
+      el.textContent = r.valid ? ('完整 · ' + r.length + ' 条') : '异常';
+    }).catch(function () { document.getElementById('chainState').textContent = '未校验'; });
+
+  document.getElementById('reload').addEventListener('click', refresh);
+  document.getElementById('statusFilter').addEventListener('change', loadApprovals);
+  refresh();
+  setInterval(function () { if (currentTab === 'approvals') loadApprovals(); }, 5000);
+})();
+</script>
+</body>
+</html>

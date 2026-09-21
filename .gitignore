@@ -1,0 +1,54 @@
+# --- build output ---------------------------------------------------------
+/bin/
+/dist/
+*.exe
+*.exe~
+*.test
+*.out
+
+# --- local runtime state --------------------------------------------------
+/data/
+/var/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+_smoke/
+
+# --- secrets --------------------------------------------------------------
+# .env.example is committed; anything you actually fill in is not.
+.env
+.env.local
+.env.*.local
+
+# --- evaluation artefacts -------------------------------------------------
+# The harness writes these on every run. The frozen sample report is committed
+# on purpose so the numbers in the README can be checked without rerunning;
+# everything else is regenerated.
+eval/report/*.json
+eval/report/*.md
+!eval/report/report.md
+
+# --- tooling / editor -----------------------------------------------------
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/
+
+# --- agent workspace ------------------------------------------------------
+# Local working notes for the development agent. Not part of the product.
+.workbuddy/
+
+# --- OS noise -------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- scratch --------------------------------------------------------------
+# Ad-hoc probes written to the repo root during debugging.
+_*.log
+_*.txt

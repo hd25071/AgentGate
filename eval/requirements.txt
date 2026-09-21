@@ -1,0 +1,3 @@
+# The harness deliberately needs almost nothing.
+# HTTP is stdlib; PyYAML is the only dependency, and only for the payload files.
+PyYAML>=6.0.1
