@@ -25,7 +25,7 @@ import data.agentgate.vrp
 # reason from the wrong subsystem is worse than no reason.
 # ---------------------------------------------------------------------------
 
-bundle_version := "2026.09.1"
+bundle_version := "2026.09.2"
 
 deny_set contains r if { input.action.target.kind == "redis"; r := redis.deny[_] }
 deny_set contains r if { input.action.target.kind == "k8s"; r := k8s.deny[_] }

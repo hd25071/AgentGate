@@ -142,6 +142,37 @@ dual if {
 }
 
 # ---------------------------------------------------------------------------
+# Session taint
+#
+# Indirect injection needs a read to happen first: the injected text arrives as
+# a log line, an alert annotation, a cached value or a ticket body, and every
+# one of those is a gateway call the gateway can see. Once a session has read,
+# a write proposed in that session may have been suggested by what it read.
+#
+# The rule is not content inspection. The gateway never tries to decide whether
+# a string looks like an instruction -- that is a classifier with no reliable
+# answer, and a false negative on it is the whole game. It tracks the data
+# flow, which it observes exactly.
+#
+# The cost is real and accepted: an agent that has read anything is asked for a
+# human on every subsequent mutation in that session.
+# ---------------------------------------------------------------------------
+
+approval contains reason if {
+	input.actor.session_tainted == true
+	input.action.verb in {"write", "delete", "config", "exec", "scale"}
+	reason := "this session has read content from a target system, so a mutation proposed now may have been suggested by what it read"
+}
+
+# Flagged on mutations only. Putting it on reads too would mark every read in
+# a tainted session as "medium" risk, and a tier that is always raised carries
+# no information.
+flags contains "session has read attacker-influenceable content" if {
+	input.actor.session_tainted == true
+	input.action.verb in {"write", "delete", "config", "exec", "scale"}
+}
+
+# ---------------------------------------------------------------------------
 # Informational flags
 # ---------------------------------------------------------------------------
 

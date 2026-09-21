@@ -28,6 +28,7 @@ type evalCase struct {
 	subject  string
 	scopes   []string
 	args     map[string]any
+	tainted  bool
 	want     string
 	wantRisk string
 }
@@ -48,7 +49,7 @@ func runCase(t *testing.T, e Engine, tc evalCase) Decision {
 	}
 	d, err := e.Decide(context.Background(), Input{
 		Action: a,
-		Actor:  Actor{Subject: subject, Scopes: tc.scopes},
+		Actor:  Actor{Subject: subject, Scopes: tc.scopes, SessionTainted: tc.tainted},
 	})
 	if err != nil {
 		t.Fatalf("decide: %v", err)
@@ -100,8 +101,29 @@ func TestPolicyVerdicts(t *testing.T) {
 		// --- Redis: writes ------------------------------------------------
 		{
 			name: "staging write is allowed", tool: "redis_exec", kind: action.KindRedis,
-			scopes: []string{"redis:write"}, args: map[string]any{"command": "SET feature:flag on"},
+			scopes: []string{"redis:write"}, args: map[string]any{"command": "SET cache:homepage v2"},
 			want: Allow,
+		},
+		{
+			// One key, snapshot-able, reversible -- and still not the agent's
+			// call. A snapshot restores the bytes; it does not restore the
+			// fact that every user's checkout path just changed.
+			name: "writing a protected namespace needs approval", tool: "redis_exec", kind: action.KindRedis,
+			scopes: []string{"redis:write"}, args: map[string]any{"command": "SET feature:flag on"},
+			want: ApprovalRequired, wantRisk: "high",
+		},
+		{
+			name: "deleting a session needs approval", tool: "redis_exec", kind: action.KindRedis,
+			scopes: []string{"redis:delete"}, args: map[string]any{"command": "DEL session:42"},
+			want: ApprovalRequired,
+		},
+		{
+			// Case must not matter: the namespace is a convention, and
+			// comparing it in the spelling it was written in is the same class
+			// of bug as the CONFIG parameter fold.
+			name: "protected namespace matching is case-insensitive", tool: "redis_exec", kind: action.KindRedis,
+			scopes: []string{"redis:delete"}, args: map[string]any{"command": "DEL LOCK:DEPLOY"},
+			want: ApprovalRequired,
 		},
 		{
 			name: "production write needs a human", tool: "redis_exec", kind: action.KindRedis,
@@ -113,6 +135,28 @@ func TestPolicyVerdicts(t *testing.T) {
 			name: "wildcard delete needs a human", tool: "redis_exec", kind: action.KindRedis,
 			scopes: []string{"redis:delete"}, args: map[string]any{"command": "DEL user:*"},
 			want: ApprovalRequired,
+		},
+
+		// --- Session taint -----------------------------------------------
+		//
+		// The same write, from the same subject, with the same scope: the only
+		// thing that changes is whether the session has read anything. That is
+		// the whole mechanism -- the gateway tracks the data flow it can see
+		// rather than guessing whether a string looks like an instruction.
+		{
+			name: "a tainted session cannot write unattended", tool: "redis_exec", kind: action.KindRedis,
+			scopes: []string{"redis:write"}, args: map[string]any{"command": "SET cache:homepage v2"},
+			tainted: true,
+			want:    ApprovalRequired, wantRisk: "high",
+		},
+		{
+			// Reads stay free. Tainting a session and then refusing to let it
+			// read would leave an agent unable to investigate at all, which is
+			// the failure mode that gets a gateway switched off.
+			name: "a tainted session can still read", tool: "redis_exec", kind: action.KindRedis,
+			scopes: []string{"redis:read"}, args: map[string]any{"command": "GET cache:homepage"},
+			tainted: true,
+			want:    Allow, wantRisk: "low",
 		},
 
 		// --- Redis: never approvable -------------------------------------

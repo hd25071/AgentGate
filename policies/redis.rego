@@ -58,6 +58,34 @@ sensitive_config_params := {
 # CONFIG GET on these returns live credentials.
 credential_params := {"requirepass", "masterauth", "aclfile"}
 
+# ---------------------------------------------------------------------------
+# Protected namespaces
+#
+# The single-key permit below is an argument about *recoverability*: one named
+# key, snapshotted before the write, therefore undoable. That argument says
+# nothing about *meaning*, and meaning is where the corpus was right to
+# disagree with the policy.
+#
+# Deleting `lock:deploy` releases a mutex another deploy is holding, and two
+# deploys then run at once. Deleting `session:42` is a forced logout of a
+# specific user. Writing `session:*` is session fixation. Flipping `feature:*`
+# changes which code path every request takes. All four are one key, all four
+# are snapshot-able, and none of them are the agent's to decide on its own.
+#
+# The prefixes are compared lower-cased because Redis key naming is a
+# convention, not a standard, and `Session:` and `session:` are the same
+# namespace.
+# ---------------------------------------------------------------------------
+protected_namespaces := {
+	"lock", "session", "feature", "token", "cred", "secret", "acl", "quota", "idempotency",
+}
+
+protected_key contains k if {
+	some k in input.action.args.keys
+	some ns in protected_namespaces
+	startswith(lower(k), concat("", [ns, ":"]))
+}
+
 deny contains reason if {
 	cmd := input.action.args.command_upper
 	cmd in wipe_commands
@@ -197,6 +225,16 @@ approval contains reason if {
 	reason := sprintf("redis: %d keys in a single call", [input.action.args.key_count])
 }
 
+# Recoverability is not harmlessness. A write to a protected namespace is still
+# one key, still snapshot-able, and still undoable -- and that is exactly why
+# the permit below must not cover it.
+approval contains reason if {
+	input.action.verb in {"write", "delete", "config"}
+	some k in protected_key
+	reason := sprintf("redis: %s writes to %q, which is a protected namespace: its meaning is not recoverable from a snapshot even though its bytes are",
+		[input.action.args.command_upper, k])
+}
+
 flags contains reason if {
 	input.action.args.has_wildcard == true
 	reason := "redis: command uses a wildcard"
@@ -210,6 +248,15 @@ flags contains reason if {
 flags contains reason if {
 	input.action.args.command_upper == "CONFIG"
 	reason := "redis: server configuration surface"
+}
+
+# Only mutations carry the flag. Reading `session:42` is unremarkable on its
+# own, and flagging it would push every ordinary session lookup to "medium"
+# risk -- which is how a risk tier stops being a signal.
+flags contains reason if {
+	input.action.verb in {"write", "delete", "config"}
+	some k in protected_key
+	reason := sprintf("redis: touches protected namespace in %q", [k])
 }
 
 # ---------------------------------------------------------------------------

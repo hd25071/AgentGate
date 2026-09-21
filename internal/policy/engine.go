@@ -51,6 +51,14 @@ type Actor struct {
 	Subject string   `json:"subject"`
 	Scopes  []string `json:"scopes"`
 	Session string   `json:"session,omitempty"`
+
+	// SessionTainted records that this session has already read content out of
+	// a target system. That content is attacker-influenceable -- a log line, a
+	// cached value, a ticket body -- and once it is in the context window every
+	// later write the agent proposes is a candidate for having been suggested
+	// by it. The gateway is the only component that can see the read happened,
+	// so the flag is set here rather than inferred by policy from the request.
+	SessionTainted bool `json:"session_tainted,omitempty"`
 }
 
 // HasScope reports whether the actor holds a scope.

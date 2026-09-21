@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hd25071/AgentGate/internal/action"
@@ -57,6 +58,11 @@ type Gateway struct {
 	exec     *executor.Executor
 	adapters *adapters.Registry
 	mcp      *mcp.Server
+
+	// taint tracks sessions that have read content out of a target system.
+	// See markTainted for why this lives in the gateway and not in policy.
+	taintMu sync.Mutex
+	tainted map[string]bool
 
 	startedAt time.Time
 }
@@ -100,6 +106,7 @@ func New(deps Deps) (*Gateway, error) {
 		exec:      executor.New(deps.Adapters, deps.Store, log),
 		adapters:  deps.Adapters,
 		mcp:       mcp.NewServer("agentgate", version.Version),
+		tainted:   map[string]bool{},
 		startedAt: time.Now(),
 	}
 	g.exec.RollbackOnFailure = deps.Config.RollbackOnFailure
@@ -191,9 +198,12 @@ func (g *Gateway) Call(ctx context.Context, tool string, kind action.Kind, args 
 	})
 
 	// 2. Decide.
+	actor := actorOf(ident)
+	actor.SessionTainted = g.sessionTainted(ident)
+
 	decision, err := g.policy.Decide(ctx, policy.Input{
 		Action: a,
-		Actor:  actorOf(ident),
+		Actor:  actor,
 		Context: map[string]any{
 			"request_id": requestID,
 			"tool":       tool,
@@ -267,6 +277,11 @@ func (g *Gateway) Call(ctx context.Context, tool string, kind action.Kind, args 
 
 	default:
 		res, _ := g.execute(ctx, requestID, "", a, decision)
+		// Only a completed read hands content back. A denied or failed call
+		// returned nothing for an attacker to have written into.
+		if readLike(a) && res.StructuredContent["status"] == "executed" {
+			g.markTainted(ident)
+		}
 		return res
 	}
 }
@@ -423,6 +438,63 @@ func actorOf(ident mcp.Identity) policy.Actor {
 		Scopes:  append([]string(nil), ident.Scopes...),
 		Session: ident.Session,
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Session taint
+//
+// Indirect prompt injection has one structural property the gateway can use:
+// for the injected text to reach the agent, the agent has to *read* something.
+// A log line, an alert annotation, a cached value, a ticket body -- all of it
+// arrives through a read, and every one of those reads is a gateway call.
+//
+// So the gateway remembers which sessions have read, and policy treats a write
+// from a tainted session differently from a write from a clean one. This is not
+// content inspection: the gateway never tries to decide whether a string looks
+// like an instruction, which is a classifier problem with no reliable answer.
+// It only tracks the data flow, which it can see exactly.
+//
+// The trade-off is deliberate friction. An agent that has read a log is asked
+// for a human on every subsequent write in that session. That costs an approval
+// prompt; the alternative is letting a string in a cache value choose what the
+// agent writes next.
+// ---------------------------------------------------------------------------
+
+// sessionKey identifies the unit the taint is scoped to. A session claim is
+// the right unit when the token carries one; otherwise the token itself is the
+// only thing distinguishing two conversations, and using it keeps an agent
+// that reconnects on every call from silently getting a clean slate each time.
+func sessionKey(ident mcp.Identity) string {
+	if ident.Session != "" {
+		return ident.Subject + "|" + ident.Session
+	}
+	if ident.TokenID != "" {
+		return ident.Subject + "|jti:" + ident.TokenID
+	}
+	return ident.Subject
+}
+
+// markTainted records that this session has read content from a target system.
+func (g *Gateway) markTainted(ident mcp.Identity) {
+	g.taintMu.Lock()
+	defer g.taintMu.Unlock()
+	if g.tainted == nil {
+		g.tainted = map[string]bool{}
+	}
+	g.tainted[sessionKey(ident)] = true
+}
+
+// sessionTainted reports whether the session has read anything yet.
+func (g *Gateway) sessionTainted(ident mcp.Identity) bool {
+	g.taintMu.Lock()
+	defer g.taintMu.Unlock()
+	return g.tainted[sessionKey(ident)]
+}
+
+// readLike reports whether executing this action hands attacker-influenceable
+// content back to the agent.
+func readLike(a *action.Action) bool {
+	return a.Verb == action.VerbRead || a.Verb == action.VerbExec
 }
 
 // digestArgs hashes the raw argument object. The gateway logs the digest, not
