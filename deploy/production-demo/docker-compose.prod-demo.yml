@@ -1,0 +1,12 @@
+services:
+  agentgate:
+    ports: !override
+      - "127.0.0.1:${AG_PORT:-18081}:8080"
+
+  demo:
+    networks:
+      - agentgate
+
+  eval:
+    networks:
+      - agentgate

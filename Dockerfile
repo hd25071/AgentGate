@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # The Go image is parameterised so a mirror can be substituted in networks
 # where Docker Hub is unreachable, e.g.
 #   docker build --build-arg GO_IMAGE=docker.m.daocloud.io/library/golang:1.26-alpine .
@@ -9,6 +7,7 @@
 # it silently downloads a matching toolchain mid-build, and in an air-gapped
 # build that turns into a confusing failure instead of a clear one.
 ARG GO_IMAGE=golang:1.26-alpine
+ARG ALPINE_IMAGE=alpine:3.20
 
 FROM ${GO_IMAGE} AS build
 WORKDIR /src
@@ -36,8 +35,8 @@ FROM ${ALPINE_IMAGE:-alpine:3.20}
 # The runtime image deliberately carries no shell tooling beyond busybox: the
 # gateway's job is to be a narrow mediation point, and the image it ships in
 # should not be a comfortable place to live after a compromise.
-RUN apk add --no-cache ca-certificates tzdata && \
-    addgroup -g 10001 -S agentgate && \
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN addgroup -g 10001 -S agentgate && \
     adduser -u 10001 -S agentgate -G agentgate && \
     mkdir -p /data && chown agentgate:agentgate /data
 
@@ -47,7 +46,8 @@ COPY --from=build /src/policies /app/policies
 
 USER 10001:10001
 
-ENV AG_HTTP_ADDR=:8080 \
+ENV TZ=UTC \
+    AG_HTTP_ADDR=:8080 \
     AG_STORE_DRIVER=sqlite \
     AG_STORE_DSN="file:/data/agentgate.db?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)" \
     AG_POLICY_DIR="" \

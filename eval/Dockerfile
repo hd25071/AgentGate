@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 ARG PYTHON_IMAGE=python:3.12-slim
 FROM ${PYTHON_IMAGE}
 

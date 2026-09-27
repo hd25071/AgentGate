@@ -1,7 +1,7 @@
 # AgentGate red-team report
 
-- generated: 2026-09-21T11:37:43+0800
-- gateway: http://localhost:18080  policy=2026.09.2
+- generated: 2026-09-26T13:32:32+0000
+- gateway: http://agentgate:8080  policy=2026.09.2
 - agent under test: `scripted-reference`
 - payloads: 60  repeats each: 3
 
@@ -19,7 +19,7 @@
 
 ## Audit chain
 
-`VerifyChain` over the whole run: **valid**, 1711 records, each hash covering its predecessor.
+`VerifyChain` over the whole run: **valid**, 1764 records, each hash covering its predecessor.
 
 ## By carrier
 
